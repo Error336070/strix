@@ -59,16 +59,25 @@ def test_view_cli_help_includes_host(capsys: pytest.CaptureFixture[str]) -> None
 
     help_text = capsys.readouterr().out
     assert "--host HOST" in help_text
-    assert "0.0.0.0" in help_text
+    assert "Loopback address" in help_text
 
 
-def test_server_can_bind_all_ipv4_interfaces(tmp_path: Path) -> None:
+def test_server_rejects_non_loopback_binding(tmp_path: Path) -> None:
     run_dir = _make_run(tmp_path, "remote", status="running", end_time=None)
-
-    httpd, url, _ = serve(run_dir, host="0.0.0.0", open_browser=False)
     try:
-        assert httpd.server_address[0] == "0.0.0.0"
-        assert url == f"http://0.0.0.0:{httpd.server_address[1]}"
+        serve(run_dir, host="0.0.0.0", open_browser=False)
+    except ValueError as exc:
+        assert "loopback" in str(exc)
+    else:
+        raise AssertionError("LAN HTTP binding must be rejected")
+
+
+def test_localhost_alias_binds_numeric_loopback(tmp_path: Path) -> None:
+    run_dir = _make_run(tmp_path, "local", status="running", end_time=None)
+    httpd, url, _ = serve(run_dir, host="localhost", open_browser=False)
+    try:
+        assert httpd.server_address[0] == "127.0.0.1"
+        assert url.startswith("http://127.0.0.1:")
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -210,6 +219,71 @@ def test_build_run_state_keeps_same_call_id_separate_per_agent(tmp_path: Path) -
     assert by_agent["child"]["data"]["result"]["output"] == "child"
 
 
+def test_blue_transcript_keeps_full_history_and_updates_tool_lifecycle(tmp_path: Path) -> None:
+    run_dir = tmp_path / "blue"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text('{"status":"running"}', encoding="utf-8")
+    log = run_dir / "codex-events.jsonl"
+    lines = [
+        json.dumps({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "text": f"message {index}"}},
+        })
+        for index in range(1005)
+    ]
+    lines.append(json.dumps({
+        "method": "item/started",
+        "params": {"item": {"id": "tool-1", "type": "dynamicToolCall", "name": "read_scope_file"}},
+    }))
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    live = build_run_state(run_dir)["events"]
+    assert len(live) == 1006
+    assert live[0]["data"]["content"] == "message 0"
+    assert live[-2]["data"]["content"] == "message 1004"
+    assert live[-1]["data"]["status"] == "running"
+    tool_id = live[-1]["id"]
+
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "method": "item/completed",
+            "params": {
+                "item": {"id": "tool-1", "type": "dynamicToolCall", "name": "read_scope_file"}
+            },
+        }) + "\n")
+    completed = build_run_state(run_dir)["events"]
+    assert len(completed) == 1006
+    assert completed[-1]["id"] == tool_id
+    assert completed[-1]["data"]["status"] == "completed"
+    assert completed[-1]["version"] == 2
+
+
+def test_runtime_evidence_link_is_token_protected_and_run_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "blue"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text('{"status":"completed"}', encoding="utf-8")
+    evidence_name = "runtime-launch-123abc.jsonl"
+    content = '{"kind":"process","status":"observed"}\n'
+    (run_dir / evidence_name).write_text(content, encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("private", encoding="utf-8")
+    _bundle(tmp_path, monkeypatch)
+    httpd, url, token = serve(run_dir, open_browser=False)
+    try:
+        path = f"{url}/api/case/evidence?file={evidence_name}"
+        assert _get_status(path) == 403
+        cookie = _session_cookie(url, token)
+        status, content_type, body = _get(path, cookie=cookie)
+        assert status == 200
+        assert content_type.startswith("text/plain")
+        assert body == (run_dir / evidence_name).read_bytes()
+        assert _get_status(f"{url}/api/case/evidence?file=..%2Fsecret.txt", cookie=cookie) == 400
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def _get(url: str, *, cookie: str | None = None) -> tuple[int, str, bytes]:
     headers = {"Cookie": cookie} if cookie else {}
     req = urllib.request.Request(url, headers=headers)  # noqa: S310 - localhost test server
@@ -265,13 +339,15 @@ def test_server_event_endpoint_forwards_cta(
         lambda cta, surface=None: seen.append((cta, surface)),
     )
 
-    httpd, url, _ = serve(run_dir, open_browser=False)
+    httpd, url, token = serve(run_dir, open_browser=False)
     try:
+        cookie = _session_cookie(url, token)
         body = json.dumps(
             {"event": "cta_clicked", "cta": "PR reviews", "surface": "sidebar_nav"}
         ).encode()
         req = urllib.request.Request(  # noqa: S310 - localhost test server
-            f"{url}/api/event", data=body, headers={"Content-Type": "application/json"}
+            f"{url}/api/event", data=body,
+            headers={"Content-Type": "application/json", "Cookie": cookie},
         )
         with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
             assert resp.status == 204
@@ -296,8 +372,9 @@ def test_server_event_endpoint_forwards_email_funnel(
         lambda step, purpose=None: seen.append((step, purpose)),
     )
 
-    httpd, url, _ = serve(run_dir, open_browser=False)
+    httpd, url, token = serve(run_dir, open_browser=False)
     try:
+        cookie = _session_cookie(url, token)
         # A whitelisted funnel event is forwarded; an unknown event is ignored.
         for payload, expected in (
             ({"event": "email_verified", "purpose": "report"}, [("email_verified", "report")]),
@@ -306,7 +383,7 @@ def test_server_event_endpoint_forwards_email_funnel(
             req = urllib.request.Request(  # noqa: S310 - localhost test server
                 f"{url}/api/event",
                 data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "Cookie": cookie},
             )
             with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
                 assert resp.status == 204
@@ -325,16 +402,66 @@ def test_server_event_endpoint_forwards_agent_steered(
     seen: list[bool] = []
     monkeypatch.setattr("strix.telemetry.posthog.viewer_agent_steered", lambda: seen.append(True))
 
-    httpd, url, _ = serve(run_dir, open_browser=False)
+    httpd, url, token = serve(run_dir, open_browser=False)
     try:
+        cookie = _session_cookie(url, token)
         req = urllib.request.Request(  # noqa: S310 - localhost test server
             f"{url}/api/event",
             data=json.dumps({"event": "agent_steered"}).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Cookie": cookie},
         )
         with urllib.request.urlopen(req) as resp:  # noqa: S310  # nosec B310
             assert resp.status == 204
         assert seen == [True]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_viewer_capabilities_and_events_require_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = _make_run(tmp_path, "protected", status="running", end_time=None)
+    _bundle(tmp_path, monkeypatch)
+    seen: list[bool] = []
+    monkeypatch.setattr("strix.telemetry.posthog.viewer_agent_steered", lambda: seen.append(True))
+
+    httpd, url, token = serve(run_dir, open_browser=False)
+    try:
+        try:
+            _get(f"{url}/api/capabilities")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+        else:
+            raise AssertionError("capabilities must reject a caller without the session")
+        assert _post(url, "/api/event", {"event": "agent_steered"})[0] == 403
+        assert seen == []
+
+        cookie = _session_cookie(url, token)
+        assert json.loads(_get(f"{url}/api/capabilities", cookie=cookie)[2]) == {
+            "can_steer": False,
+            "owner_run": "protected",
+        }
+        assert _post(url, "/api/event", {"event": "agent_steered"}, cookie=cookie)[0] == 204
+        assert seen == [True]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_viewer_rejects_oversize_post_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = _make_run(tmp_path, "bounded", status="running", end_time=None)
+    _bundle(tmp_path, monkeypatch)
+    httpd, url, token = serve(run_dir, open_browser=False)
+    try:
+        cookie = _session_cookie(url, token)
+        status, body = _post(
+            url, "/api/event", {"event": "agent_steered", "padding": "x" * 65536}, cookie=cookie
+        )
+        assert status == 413
+        assert json.loads(body) == {"error": "body_too_large"}
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -722,6 +849,9 @@ def test_case_api_links_blue_and_standard_with_local_token(
         assert payload["findings"] == [
             {
                 "run_id": "blue",
+                "run_selector": next(
+                    run["selector"] for run in payload["runs"] if run["run_id"] == "blue"
+                ),
                 "id": "F-1",
                 "title": "Recorded issue",
                 "severity": "low",

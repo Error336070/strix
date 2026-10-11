@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from strix.core.paths import runs_base_dir
@@ -20,15 +21,30 @@ from strix.interface.blue_local import validate_loopback_endpoint
 from strix.report.cases import resolve_case_run
 
 
-def stage_handoff(
+if TYPE_CHECKING:
+    import argparse
+
+    from strix.report.cases import CaseRun
+
+
+def _copy_verified_snapshot(
+    snapshot: Path, target: Path, files: list[dict[str, object]]
+) -> None:
+    # Preserve unexpected links as links, so inventory rejects them rather
+    # than dereferencing an out-of-scope file during staging.
+    shutil.copytree(snapshot, target, symlinks=True)
+    if inventory(target) != files:
+        raise BlueError("Staged target differs from Blue evidence.")
+
+
+def _review_blue_selection(
     run_name: str,
     finding_ids: list[str],
     questions: list[str],
     scope: str,
     model: str | None,
     endpoint: str | None,
-) -> tuple[Path, dict[str, object]]:
-    """Copy a verified Blue snapshot and only the selected recorded findings."""
+) -> tuple[CaseRun, dict[str, Any], Path, list[dict[str, Any]], dict[str, object]]:
     source = resolve_case_run(run_name)
     if source is None or source.mode != "blue":
         raise BlueError("Select a unique Blue run in the registered catalog.")
@@ -57,21 +73,11 @@ def stage_handoff(
         validate_loopback_endpoint(endpoint)
     if model is not None and (not model.startswith("openai/") or len(model) <= len("openai/")):
         raise BlueError("Standard's local OpenAI-compatible model must use openai/MODEL.")
-    base = runs_base_dir().resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    stage = base / "handoffs" / f"handoff-{uuid4().hex[:12]}"
-    stage.mkdir(parents=True, exist_ok=False)
-    target = stage / "target"
-    shutil.copytree(snapshot, target, symlinks=False)
-    if inventory(target) != manifest["files"]:
-        raise BlueError("Staged target differs from Blue evidence.")
-    record: dict[str, object] = {
-        "schema": "strix-reviewed-handoff-v1",
-        "created_utc": datetime.now(UTC).isoformat(),
+    preview: dict[str, object] = {
         "case_id": source.case_id,
-        "parent_run_id": source.run_id,
+        "parent_run_id": source.selector,
+        "parent_run_name": source.run_id,
         "blue_run": str(source.path),
-        "target": str(target),
         "files": manifest["files"],
         "findings": findings,
         "finding_refs": [item["id"] for item in findings],
@@ -79,10 +85,81 @@ def stage_handoff(
         "scope": scope,
         "standard_model": model,
         "standard_endpoint": endpoint,
-        "launch_ready": model is not None and endpoint is not None,
-        "runtime_observations": "missing unless recorded in Blue evidence",
     }
-    (stage / "handoff.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    preview["preview_sha256"] = hashlib.sha256(
+        json.dumps(preview, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return source, manifest, snapshot, findings, preview
+
+
+def preview_handoff(
+    run_name: str,
+    finding_ids: list[str],
+    questions: list[str],
+    scope: str,
+    model: str | None,
+    endpoint: str | None,
+) -> dict[str, object]:
+    """Review a selected handoff without creating files or launching Standard."""
+    return _review_blue_selection(
+        run_name, finding_ids, questions, scope, model, endpoint
+    )[4]
+
+
+def stage_handoff(
+    run_name: str,
+    finding_ids: list[str],
+    questions: list[str],
+    scope: str,
+    model: str | None,
+    endpoint: str | None,
+    *,
+    expected_preview_digest: str | None = None,
+) -> tuple[Path, dict[str, object]]:
+    """Copy a freshly verified Blue snapshot after optional preview approval."""
+    source, manifest, snapshot, findings, preview = _review_blue_selection(
+        run_name, finding_ids, questions, scope, model, endpoint
+    )
+    if expected_preview_digest is not None and preview["preview_sha256"] != expected_preview_digest:
+        raise BlueError("Blue evidence or handoff scope changed after preview.")
+    base = runs_base_dir().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    handoffs = base / "handoffs"
+    stage = handoffs / f"handoff-{uuid4().hex[:12]}"
+    stage.mkdir(parents=True, exist_ok=False)
+    target = stage / "target"
+    try:
+        _copy_verified_snapshot(snapshot, target, manifest["files"])
+        record: dict[str, object] = {
+            "schema": "strix-reviewed-handoff-v1",
+            "created_utc": datetime.now(UTC).isoformat(),
+            "case_id": source.case_id,
+            "parent_run_id": source.selector,
+            "parent_run_name": source.run_id,
+            "blue_run": str(source.path),
+            "target": str(target),
+            "files": manifest["files"],
+            "findings": findings,
+            "finding_refs": [item["id"] for item in findings],
+            "questions": questions,
+            "scope": scope,
+            "standard_model": model,
+            "standard_endpoint": endpoint,
+            "preview_sha256": preview["preview_sha256"],
+            "launch_ready": model is not None and endpoint is not None,
+            "runtime_observations": "missing unless recorded in Blue evidence",
+        }
+        (stage / "handoff.json").write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        # This fresh directory is still a direct child of the chosen handoffs
+        # root. Do not leave a partial copy looking like a reviewable handoff.
+        if stage.parent == handoffs and not stage.is_symlink():
+            shutil.rmtree(stage)
+        raise
     return stage, record
 
 
@@ -132,13 +209,81 @@ def load_staged_handoff(stage: Path) -> dict[str, object]:
     return record
 
 
-def run_handoff(args: object) -> None:
+def _standard_command(
+    stage: Path, model: str, endpoint: str, expected_hash: str
+) -> tuple[list[str], dict[str, str]]:
+    """Recheck the exact reviewed record and return Standard's isolated route."""
+    if not model.startswith("openai/") or len(model) <= len("openai/"):
+        raise BlueError("Standard's local model must use openai/MODEL.")
+    validate_loopback_endpoint(endpoint)
+    current_hash = hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest()
+    if current_hash != expected_hash:
+        raise BlueError("Handoff changed during approval; staged copy retained.")
+    record = load_staged_handoff(stage)
+    questions = record.get("questions")
+    finding_refs = record.get("finding_refs")
+    if not isinstance(questions, list) or not isinstance(finding_refs, list):
+        raise BlueError("Staged handoff questions or finding references are invalid.")
+    instruction = (
+        "Investigate only the staged target and within this scope: " + str(record["scope"]) + "\n"
+        "Questions: " + "; ".join(str(item) for item in questions) + "\n"
+        "Reviewed evidence: " + json.dumps(record["findings"], ensure_ascii=False)
+    )
+    environment = os.environ.copy()
+    environment["STRIX_LLM"] = model
+    environment["LLM_API_BASE"] = endpoint
+    environment["LLM_API_KEY"] = "local-only"
+    environment["STRIX_API_TYPE"] = "chat_completions"
+    # -P excludes the working directory; pin imports to the Strix package that
+    # created this handoff, even when Standard is launched from a target folder.
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    environment.pop("OPENAI_API_BASE", None)
+    environment.pop("OPENAI_BASE_URL", None)
+    command = [
+        sys.executable,
+        "-P",
+        "-c",
+        "from strix.interface.main import main; main()",
+        "--target",
+        str(stage / "target"),
+        "--case-id",
+        str(record["case_id"]),
+        "--parent-run-id",
+        str(record["parent_run_id"]),
+        *[
+            piece
+            for finding_id in finding_refs
+            for piece in ("--finding-ref", str(finding_id))
+        ],
+        "--instruction",
+        instruction,
+    ]
+    return command, environment
+
+
+def launch_staged_handoff(
+    stage: Path, model: str, endpoint: str, *, expected_hash: str
+) -> int:
+    """Launch Standard in its own Windows console after a TUI approval."""
+    if os.name != "nt":
+        raise BlueError("TUI handoff launch currently requires a Windows console.")
+    command, environment = _standard_command(stage, model, endpoint, expected_hash)
+    process = subprocess.Popen(  # noqa: S603
+        command,
+        env=environment,
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+    return process.pid
+
+
+def run_handoff(args: argparse.Namespace) -> None:
     endpoint = getattr(args, "endpoint", None)
     if args.staged is not None:
         if not args.launch or args.run or args.finding or args.scope or args.question:
             raise BlueError("--staged is for launching a saved handoff without new scope edits.")
-        stage = args.staged.resolve(strict=True)
+        stage = args.staged
         record = load_staged_handoff(stage)
+        stage = stage.resolve(strict=True)
     else:
         if not args.run or not args.finding or not args.scope:
             raise BlueError("A Blue run, at least one finding, and --scope are required.")
@@ -154,45 +299,10 @@ def run_handoff(args: object) -> None:
         return
     if not args.model or not endpoint:
         raise BlueError("Standard launch needs --model and --endpoint.")
-    if not args.model.startswith("openai/") or len(args.model) <= len("openai/"):
-        raise BlueError("Standard's local model must use openai/MODEL.")
-    validate_loopback_endpoint(endpoint)
     print(f"Standard model: {args.model}; endpoint: {endpoint}")
     reviewed_hash = hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest()
     phrase = f"STANDARD {reviewed_hash[:8]}"
     if input(f"Type {phrase} to launch: ").strip() != phrase:
         raise BlueError("Standard launch cancelled; staged copy retained.")
-    if hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest() != reviewed_hash:
-        raise BlueError("Handoff changed during approval; staged copy retained.")
-    record = load_staged_handoff(stage)
-    instruction = (
-        "Investigate only the staged target and within this scope: " + str(record["scope"]) + "\n"
-        "Questions: " + "; ".join(str(item) for item in record["questions"]) + "\n"
-        "Reviewed evidence: " + json.dumps(record["findings"], ensure_ascii=False)
-    )
-    environment = os.environ.copy()
-    environment["STRIX_LLM"] = args.model
-    environment["LLM_API_BASE"] = endpoint
-    environment["LLM_API_KEY"] = "local-only"
-    environment["STRIX_API_TYPE"] = "chat_completions"
-    environment.pop("OPENAI_API_BASE", None)
-    environment.pop("OPENAI_BASE_URL", None)
-    command = [
-        sys.executable,
-        "-c",
-        "from strix.interface.main import main; main()",
-        "--target",
-        str(stage / "target"),
-        "--case-id",
-        str(record["case_id"]),
-        "--parent-run-id",
-        str(record["parent_run_id"]),
-        *[
-            piece
-            for finding_id in record["finding_refs"]
-            for piece in ("--finding-ref", str(finding_id))
-        ],
-        "--instruction",
-        instruction,
-    ]
+    command, environment = _standard_command(stage, args.model, endpoint, reviewed_hash)
     subprocess.run(command, env=environment, check=True)  # noqa: S603

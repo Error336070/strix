@@ -58,6 +58,7 @@ def _positive_int(value: str) -> int:
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="strix",
         description="Strix Multi-Agent Cybersecurity Penetration Testing Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""

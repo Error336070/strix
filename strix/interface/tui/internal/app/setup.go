@@ -35,7 +35,7 @@ func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
 		if value == "/blue cancel" {
 			return *m, send(m.client, "setup.blue_cancel", map[string]any{})
 		}
-		phrase := "RUN " + preview.ScopeSHA256[:min(8, len(preview.ScopeSHA256))]
+		phrase := "RUN " + preview.ManifestSHA256[:min(8, len(preview.ManifestSHA256))]
 		if value != phrase {
 			m.setupMsg("Review the Blue manifest, then type "+phrase+" or /blue cancel", render.Col(amber))
 			return *m, nil

@@ -112,13 +112,13 @@ export default function PastRunsView({
         ))}
       </div>
       {runs.runs.filter((run) => mode === "all" || run.mode === mode).map((run: RunListEntry) => {
-        const active = run.name === activeRun;
+        const active = run.selector === activeRun;
         const date = formatTimeAgo(run.start_time) ?? formatTimeAgo(run.end_time);
         const title = runTitle(run.target, run.name);
         return (
           <button
-            key={run.name}
-            onClick={() => onSelectRun(run.name)}
+            key={run.selector}
+            onClick={() => onSelectRun(run.selector)}
             className={`animate-card-in group flex w-full cursor-pointer items-center gap-4 rounded-lg border px-4 py-3 text-left transition-colors ${
               active
                 ? "border-[#444] bg-[rgba(255,255,255,0.04)]"

@@ -33,6 +33,7 @@ import {
   type CaseEvent,
   type CaseFinding,
   type CaseHandoff,
+  type RuntimeObservationCounts,
 } from "@/data/serverSource";
 import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
@@ -61,6 +62,7 @@ export default function App() {
   const [caseHandoffs, setCaseHandoffs] = useState<CaseHandoff[]>([]);
   const [caseId, setCaseId] = useState("");
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
+  const [runtimeObservations, setRuntimeObservations] = useState<RuntimeObservationCounts>({ total: 0, by_run: {} });
   // Whether this viewer can steer a live scan (true only inside the in-TUI
   // launcher that shares the running scan's coordinator + event loop).
   const [steeringOwner, setSteeringOwner] = useState<string | null>(null);
@@ -84,9 +86,10 @@ export default function App() {
           setCaseFindings(detail.findings);
           setCaseHandoffs(detail.handoffs);
           setCaseEvents(events);
+          setRuntimeObservations(detail.runtime_observations);
         }
       } catch {
-        if (!cancelled) { setCaseRuns([]); setCaseFindings([]); setCaseHandoffs([]); setCaseEvents([]); }
+        if (!cancelled) { setCaseId(""); setCaseRuns([]); setCaseFindings([]); setCaseHandoffs([]); setCaseEvents([]); setRuntimeObservations({ total: 0, by_run: {} }); }
       }
     };
     void refresh();
@@ -177,6 +180,12 @@ export default function App() {
     [run]
   );
   const selected = run?.vulnerabilities.find((v) => v.id === selectedId) ?? null;
+  const selectedRunName = run?.summary.runName ?? null;
+  const uniqueSelectedName = selectedRunName !== null && caseRuns.filter((item) => item.run_id === selectedRunName).length === 1;
+  const selectedFollowUpCount = selected ? caseRuns.filter((item) =>
+    ((activeRun !== null && item.parent_run_id === activeRun) || (uniqueSelectedName && item.parent_run_id === selectedRunName))
+      && item.finding_refs.includes(selected.id)
+  ).length : 0;
   const agentCount = run?.transcript.agents.length ?? 0;
   const isBlue = run?.raw.mode === "blue";
 
@@ -206,12 +215,6 @@ export default function App() {
   // user has navigated manually (userSetView flips the guard).
   const initialViewAppliedRef = useRef(false);
 
-  // Reset the guard whenever the active run changes so the newly selected run
-  // gets its own default.
-  useEffect(() => {
-    initialViewAppliedRef.current = false;
-  }, [activeRun]);
-
   useEffect(() => {
     if (initialViewAppliedRef.current || !run) return;
     if (run.finished) {
@@ -237,6 +240,12 @@ export default function App() {
     setSelectedId(null);
     setRun(null);
     setError(null);
+    setCaseId("");
+    setCaseRuns([]);
+    setCaseFindings([]);
+    setCaseHandoffs([]);
+    setCaseEvents([]);
+    setRuntimeObservations({ total: 0, by_run: {} });
     // Reset the guard so the per-run default applies to the newly selected run.
     initialViewAppliedRef.current = false;
   }, []);
@@ -314,11 +323,16 @@ export default function App() {
               findings={caseFindings}
               handoffs={caseHandoffs}
               events={caseEvents}
+              runtimeObservations={runtimeObservations}
               onSelectRun={selectRun}
-              onOpenFinding={(runId, findingId) => {
-                selectRun(runId);
+              onOpenFinding={(selector, findingId) => {
+                selectRun(selector);
                 setSelectedId(findingId);
                 userSetView("issues");
+              }}
+              onOpenEvent={(event) => {
+                selectRun(event.run_selector);
+                userSetView("agents");
               }}
             />
           ) : view === "history" ? (
@@ -350,11 +364,9 @@ export default function App() {
                 <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
                   Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
                 </TabButton>
-                {agentCount > 0 && (
-                  <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
-                    Agents ({agentCount})
-                  </TabButton>
-                )}
+                <TabButton active={view === "agents"} onClick={() => userSetView("agents")}>
+                  Agents ({agentCount})
+                </TabButton>
               </div>
 
               {view === "overview" ? (
@@ -365,7 +377,7 @@ export default function App() {
                   reportMarkdown={run.reportMarkdown}
                   raw={run.raw}
                 />
-              ) : view === "agents" && agentCount > 0 ? (
+              ) : view === "agents" ? (
                 <AgentsTab
                   run={run}
                   canSteer={steeringOwner !== null && (activeRun ?? steeringOwner) === steeringOwner}
@@ -382,8 +394,8 @@ export default function App() {
                   <div className="rounded-lg border border-[#333] p-4 text-sm">
                     <h2 className="font-semibold">Case evidence links</h2>
                     <p className="mt-2 text-[#aaa]">Source or binary location: {selected.code_locations?.map((location) => `${location.file}:${location.start_line}`).join(", ") || selected.target || "Missing exact location"}</p>
-                    <p className="mt-2 text-[#aaa]">Runtime observation: {caseEvents.filter((item) => item.finding_id === selected.id).length ? `${caseEvents.filter((item) => item.finding_id === selected.id).length} recorded events` : "Missing linked observation"}</p>
-                    <p className="mt-2 text-[#aaa]">Standard follow-ups: {caseRuns.filter((item) => item.parent_run_id === (activeRun || run.summary.runName) && item.finding_refs.includes(selected.id)).length || "None recorded"}</p>
+                    <p className="mt-2 text-[#aaa]">Runtime observation: {runtimeObservations.total ? `${runtimeObservations.total} case-level recorded; finding-specific link missing` : "Missing recorded observation"}</p>
+                    <p className="mt-2 text-[#aaa]">Standard follow-ups: {selectedFollowUpCount || "None recorded"}</p>
                   </div>
                 </div>
               ) : (
@@ -416,14 +428,16 @@ function RunSwitcher({
   onSelect: (name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const activeEntry = runs.runs.find((r) => r.name === activeRun);
+  const activeEntry = runs.runs.find((r) => r.selector === activeRun);
   const current = activeEntry ? runTitle(activeEntry.target, activeEntry.name) : launchedName;
   return (
-    <div className="relative">
+    <div className="relative" onBlur={(event) => {
+      if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+    }}>
       <button
         onClick={() => setOpen((o) => !o)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-        aria-label="Switch pentest"
+        aria-label="Switch run"
+        aria-expanded={open}
         className="flex items-center gap-2 rounded-lg border border-[#3a3a3a] bg-[rgba(255,255,255,0.05)] px-3 py-2 text-sm text-white transition-colors hover:border-[#555] hover:bg-[rgba(255,255,255,0.09)]"
       >
         <History className="h-4 w-4 flex-shrink-0 text-[#888]" aria-hidden="true" />
@@ -437,14 +451,14 @@ function RunSwitcher({
           style={{ border: "1px solid #3a3a3a", background: "#0a0a0a" }}
         >
           <div className="border-b border-[#222] px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-[#666]">
-            Switch pentest
+            Switch run
           </div>
           {runs.runs.map((r) => {
-            const active = r.name === activeRun;
+            const active = r.selector === activeRun;
             return (
               <button
-                key={r.name}
-                onMouseDown={() => onSelect(r.name)}
+                key={r.selector}
+                onClick={() => { onSelect(r.selector); setOpen(false); }}
                 className={`flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm transition-colors hover:bg-[rgba(255,255,255,0.06)] ${
                   active ? "bg-[rgba(255,255,255,0.04)] text-white" : "text-[#aaa]"
                 }`}

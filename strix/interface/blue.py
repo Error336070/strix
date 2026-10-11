@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -20,6 +21,7 @@ from strix.core.paths import runs_base_dir
 from strix.interface.blue_codex import run_codex
 from strix.interface.blue_findings import save_findings
 from strix.interface.blue_local import run_local, validate_loopback_endpoint
+from strix.interface.blue_pe import trusted_helper_record, validate_helper_record
 from strix.interface.cli_args import parse_arguments, terminal_attached
 from strix.interface.interactive import run_tui
 
@@ -102,8 +104,14 @@ def build_manifest(
     case_id: str | None = None,
     pe_audit: Path | None = None,
 ) -> dict[str, Any]:
+    if target.is_symlink() or target.is_junction():
+        raise BlueError("Target must not be a symlink or junction.")
+    if str(target).startswith(("\\\\", "//")) or str(output).startswith(("\\\\", "//")):
+        raise BlueError("UNC and device paths are outside the local Blue scope.")
     target = target.resolve(strict=True)
     output = output.parent.resolve(strict=False) / output.name
+    if str(target).startswith(("\\\\", "//")) or str(output).startswith(("\\\\", "//")):
+        raise BlueError("UNC and device paths are outside the local Blue scope.")
     if _contained(output, target) or _contained(target, output):
         raise BlueError("Output must be outside the target and its parent directories.")
     if output.exists():
@@ -117,10 +125,7 @@ def build_manifest(
     entries = inventory(target)
     tool_record = None
     if pe_audit is not None:
-        tool = pe_audit.resolve(strict=True)
-        if not tool.is_file():
-            raise BlueError("PE helper must be a regular file.")
-        tool_record = {"path": str(tool), "sha256": _file_hash(tool)}
+        tool_record = trusted_helper_record(pe_audit, target, output)
     manifest: dict[str, Any] = {
         "schema": "strix-blue-local-v1",
         "created_utc": datetime.now(UTC).isoformat(),
@@ -275,7 +280,7 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--file", type=Path, help="Relative .exe path within a directory target")
     observe.add_argument("--pid", type=int, help="Existing process ID for attach")
     observe.add_argument(
-        "--timeout", type=float, default=5.0, help="Observation seconds (0.1 to 30)"
+        "--timeout", type=_observation_seconds, default=5.0, help="Observation seconds (0.1 to 30)"
     )
     handoff = sub.add_parser("handoff", help="Stage a reviewed Blue finding for Standard")
     handoff.add_argument("run", nargs="?", help="Blue run name in the shared catalog")
@@ -286,18 +291,37 @@ def _parser() -> argparse.ArgumentParser:
         "--staged", type=Path, help="Launch a previously reviewed handoff directory"
     )
     handoff.add_argument("--model", help="Local Standard model route")
-    handoff.add_argument(
-        "--endpoint", help="Loopback OpenAI-compatible /v1 endpoint"
-    )
+    handoff.add_argument("--endpoint", help="Loopback OpenAI-compatible /v1 endpoint")
     handoff.add_argument("--launch", action="store_true", help="Launch Standard after review")
     return parser
 
 
+def _observation_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("observation time must be a number") from exc
+    if not math.isfinite(seconds) or not 0.1 <= seconds <= 30:
+        raise argparse.ArgumentTypeError("observation time must be between 0.1 and 30 seconds")
+    return seconds
+
+
 def _run_prepared(  # noqa: PLR0912, PLR0915
-    manifest_path: Path, *, confirmed_phrase: str | None = None
-) -> None:
+    manifest_path: Path,
+    *,
+    confirmed_phrase: str | None = None,
+    expected_manifest_sha256: str | None = None,
+) -> str:
     manifest_path = manifest_path.absolute()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    if (
+        expected_manifest_sha256 is not None
+        and hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha256
+    ):
+        raise BlueError("Blue manifest changed since the scope preview. Prepare a new run.")
+    manifest = json.loads(manifest_bytes)
+    if not isinstance(manifest, dict):
+        raise BlueError("Blue manifest must contain an object.")
     if manifest.get("schema") != "strix-blue-local-v1":
         raise BlueError("Unsupported Blue manifest schema.")
     target = Path(manifest["target"]).resolve(strict=True)
@@ -327,33 +351,52 @@ def _run_prepared(  # noqa: PLR0912, PLR0915
         validate_loopback_endpoint(manifest["endpoint"])
     elif manifest["provider"] != "codex-subscription" or manifest["endpoint"] is not None:
         raise BlueError("Unsupported provider settings.")
+    validate_helper_record(manifest)
     print(f"Target: {target}")
     print(
         f"Files: {len(manifest['files'])}; provider: {manifest['provider']}; "
         f"model: {manifest['model']}; approval: {approval}"
     )
     print("Target files are copied into a hash-checked snapshot. Strix scan tools are disabled.")
+    if manifest.get("pe_audit"):
+        print(
+            "PE inspection runs the configured RE-LAB helper executable: "
+            f"{manifest['pe_audit']['path']} (SHA-256 {manifest['pe_audit']['sha256']})."
+        )
     if approval == "auto-review":
         print(
             "Auto-review may approve Codex escalation requests. "
             "It does not enforce a target path allowlist."
         )
     phrase = f"RUN {manifest['files'][0]['sha256'][:8]}"
-    supplied = (
-        input(f"Type {phrase} to start: ").strip()
-        if confirmed_phrase is None
-        else confirmed_phrase
-    )
+    try:
+        supplied = (
+            input(f"Type {phrase} to start: ").strip()
+            if confirmed_phrase is None
+            else confirmed_phrase
+        )
+    except EOFError as exc:
+        raise BlueError("Blue run needs an interactive approval.") from exc
     if supplied != phrase:
         raise BlueError("Run cancelled.")
     manifest["status"] = "running"
     _json(manifest_path, manifest)
     _event(output, "run_started", "Blue analysis started")
+    count: int | None = None
     try:
         outcome = (run_codex if manifest["provider"] == "codex-subscription" else run_local)(
             manifest, output
         )
         manifest["status"] = outcome
+        if outcome == "completed":
+            try:
+                count = save_findings(output, manifest)
+            except (OSError, TypeError, ValueError) as exc:
+                manifest["status"] = "failed"
+                (output / "findings-validation-error.txt").write_text(str(exc), encoding="utf-8")
+                print(f"Blue findings could not be saved: {exc}", file=sys.stderr)
+            else:
+                _event(output, "findings_recorded", f"{count} validated findings")
     except Exception:
         manifest["status"] = "failed"
         raise
@@ -361,15 +404,10 @@ def _run_prepared(  # noqa: PLR0912, PLR0915
         manifest["ended_utc"] = datetime.now(UTC).isoformat()
         _json(manifest_path, manifest)
         _event(output, "run_finished", f"Blue analysis {manifest['status']}")
-    if manifest["status"] == "completed":
-        try:
-            count = save_findings(output, manifest)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            (output / "findings-validation-error.txt").write_text(str(exc), encoding="utf-8")
-            count = 0
+    if count is not None:
         print(f"Structured findings: {count}. Missing entries stay unreported in the case view.")
-        _event(output, "findings_recorded", f"{count} validated findings")
     print(f"Run {manifest['status']}. Evidence: {output}")
+    return manifest["status"]
 
 
 def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI validation flow
@@ -383,6 +421,8 @@ def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI 
 
     manifest_path = args.manifest.resolve(strict=True)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise BlueError("Blue manifest must contain an object.")
     output = Path(manifest["output"]).resolve(strict=True)
     if manifest.get("schema") != "strix-blue-local-v1" or manifest_path != output / "manifest.json":
         raise BlueError("Expected a Blue manifest in its declared output directory.")
@@ -455,7 +495,7 @@ def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI 
     print(f"Runtime observation {result.status}. Evidence: {evidence}")
 
 
-def run_blue(argv: list[str]) -> int:
+def run_blue(argv: list[str]) -> int:  # noqa: PLR0911 - Distinct CLI exit states.
     if not argv:
         if not terminal_attached():
             print(
@@ -468,6 +508,8 @@ def run_blue(argv: list[str]) -> int:
         args.blue_mode = True
         try:
             asyncio.run(run_tui(args))
+        except KeyboardInterrupt:
+            return 130
         except RuntimeError as exc:
             print(f"Blue workspace stopped: {exc}", file=sys.stderr)
             return 2
@@ -493,14 +535,22 @@ def run_blue(argv: list[str]) -> int:
             print(json.dumps(manifest, indent=2, ensure_ascii=False))
             print(f'\nRun when ready: strix blue run "{path.absolute()}"')
         elif args.command == "run":
-            _run_prepared(args.manifest)
+            return 0 if _run_prepared(args.manifest) == "completed" else 1
         elif args.command == "observe":
             _observe_prepared(args)
         else:
             from strix.interface.blue_handoff import run_handoff  # noqa: PLC0415
 
             run_handoff(args)
-    except (BlueError, OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
+    except (
+        BlueError,
+        OSError,
+        ValueError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"Blue run stopped: {exc}", file=sys.stderr)
         return 2
     return 0

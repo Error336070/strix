@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -10,7 +11,7 @@ from pydantic import AliasChoices, Field, ValidationError
 from pydantic.fields import FieldInfo
 
 from strix.config import loader
-from strix.config.settings import ContextSettings
+from strix.config.settings import ContextSettings, TelemetrySettings
 
 
 if TYPE_CHECKING:
@@ -38,6 +39,15 @@ _LLM_ENV_KEYS = [
     # TelemetrySettings
     "STRIX_TELEMETRY",
 ]
+
+
+def test_telemetry_defaults_off_and_can_be_enabled_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STRIX_TELEMETRY", raising=False)
+    assert TelemetrySettings().enabled is False
+    monkeypatch.setenv("STRIX_TELEMETRY", "1")
+    assert TelemetrySettings().enabled is True
 
 
 @pytest.fixture(autouse=True)
@@ -406,6 +416,7 @@ def test_persist_current_replaces_corrupt_file(
     assert json.loads(target.read_text(encoding="utf-8")) == {"env": {"STRIX_LLM": "env-model"}}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not enforced on Windows")
 def test_persist_current_sets_0600_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STRIX_LLM", "persisted-model")
     target = tmp_path / "cli-config.json"

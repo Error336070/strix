@@ -132,7 +132,11 @@ def launch_confirmation_phrase(
 
 
 def _validate_timeout(value: float) -> float:
-    if not isinstance(value, (int, float)) or not 0.1 <= value <= _MAX_SECONDS:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0.1 <= value <= _MAX_SECONDS
+    ):
         raise RuntimeObservationError("Observation time must be between 0.1 and 30 seconds.")
     return float(value)
 
@@ -254,13 +258,12 @@ def observe_runtime(  # noqa: PLR0912, PLR0915
         expected = launch_confirmation_phrase(permit, evidence, seconds)
         if confirmation_phrase != expected:
             raise RuntimeObservationError("Launch confirmation phrase does not match this request.")
-    elif not permit.allow_attach or not isinstance(pid, int) or pid <= 0:
+    elif not permit.allow_attach or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise RuntimeObservationError("Permit does not allow this attach request.")
     print(WARNING, file=sys.stderr)  # noqa: T201
     process: subprocess.Popen[bytes] | _AttachedProcess | None = None
     launched: subprocess.Popen[bytes] | None = None
     attached: _AttachedProcess | None = None
-    started = time.monotonic()
     sequence = 0
     exit_code: int | None = None
     status: Literal["exited", "timed_out"] = "timed_out"
@@ -301,6 +304,7 @@ def observe_runtime(  # noqa: PLR0912, PLR0915
                         "PID image path does not match the permitted target."
                     )
                 _validate_target(permit)
+                started = time.monotonic()
             else:
                 _validate_target(permit)
                 event("launch_requested", sync=True)
@@ -314,6 +318,7 @@ def observe_runtime(  # noqa: PLR0912, PLR0915
                     close_fds=True,
                 )
                 process = launched
+                started = time.monotonic()
                 event("process_started")
                 _validate_target(permit)
 
@@ -343,6 +348,9 @@ def observe_runtime(  # noqa: PLR0912, PLR0915
                     event("launched_process_exited_after_kill", exit_code=exit_code)
                 except subprocess.TimeoutExpired:
                     event("launched_process_kill_wait_timed_out")
+                    raise RuntimeObservationError(
+                        "Launched process termination could not be confirmed."
+                    ) from None
         except BaseException as exc:
             with suppress(OSError):
                 event("observation_failed", error_type=type(exc).__name__, error=str(exc))

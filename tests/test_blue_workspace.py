@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,7 +8,13 @@ import pytest
 
 from strix.interface.blue import BlueError, _copy_snapshot, build_manifest
 from strix.interface.blue_findings import extract_findings, save_findings
-from strix.interface.blue_handoff import load_staged_handoff, run_handoff, stage_handoff
+from strix.interface.blue_handoff import (
+    _standard_command,
+    load_staged_handoff,
+    preview_handoff,
+    run_handoff,
+    stage_handoff,
+)
 from strix.report.cases import case_timeline, list_case_runs
 
 
@@ -32,12 +39,20 @@ def test_source_finding_handoff_is_hashed_and_linked(
         "</strix-findings-json>", encoding="utf-8",
     )
     assert save_findings(output, manifest) == 1
-    stage, record = stage_handoff(
+    preview = preview_handoff(
         "blue-source", ["F-1"], ["Can this be reproduced?"],
         "Only the staged copy; no remote endpoints", "openai/local-test", "http://127.0.0.1:11434/v1",
     )
+    assert not (tmp_path / "runs" / "handoffs").exists()
+    stage, record = stage_handoff(
+        "blue-source", ["F-1"], ["Can this be reproduced?"],
+        "Only the staged copy; no remote endpoints", "openai/local-test", "http://127.0.0.1:11434/v1",
+        expected_preview_digest=str(preview["preview_sha256"]),
+    )
+    assert record["preview_sha256"] == preview["preview_sha256"]
     assert record["case_id"] == "case-1"
-    assert record["parent_run_id"] == "blue-source"
+    assert record["parent_run_id"] == list_case_runs()[0].selector
+    assert record["parent_run_name"] == "blue-source"
     assert (stage / "target" / "owned.cs").read_bytes() == target.read_bytes()
     assert len(record["findings"]) == 1
     assert load_staged_handoff(stage)["finding_refs"] == ["F-1"]
@@ -85,7 +100,35 @@ def test_handoff_launch_rechecks_staged_copy_after_approval(
         json.dumps([{"id": "F-1", "title": "Owned fixture", "path": "owned.cs"}]),
         encoding="utf-8",
     )
+    preview = preview_handoff("blue-source", ["F-1"], [], "Staged copy only", None, None)
+    findings_path = blue_run / "vulnerabilities.json"
+    findings_original = findings_path.read_text(encoding="utf-8")
+    findings_path.write_text(
+        json.dumps([{"id": "F-1", "title": "Changed", "path": "owned.cs"}]),
+        encoding="utf-8",
+    )
+    with pytest.raises(BlueError, match="changed after preview"):
+        stage_handoff(
+            "blue-source", ["F-1"], [], "Staged copy only", None, None,
+            expected_preview_digest=str(preview["preview_sha256"]),
+        )
+    assert not (tmp_path / "runs" / "handoffs").exists()
+    findings_path.write_text(findings_original, encoding="utf-8")
     stage, _ = stage_handoff("blue-source", ["F-1"], [], "Staged copy only", None, None)
+
+    command, environment = _standard_command(
+        stage, "openai/local-test", "http://127.0.0.1:11434/v1",
+        hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest(),
+    )
+    assert command[1:3] == ["-P", "-c"]
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "strix.py").write_text("raise RuntimeError('shadowed')", encoding="utf-8")
+    imported = subprocess.run(  # noqa: S603 - fixed import-only smoke script
+        [*command[:3], "from strix.interface.main import main; print(main.__module__)"],
+        cwd=shadow, env=environment, check=True, capture_output=True, text=True,
+    )
+    assert imported.stdout.strip() == "strix.interface.main"
 
     def tamper_at_prompt(_prompt: str) -> str:
         (stage / "target" / "owned.cs").write_text("changed\n", encoding="utf-8")

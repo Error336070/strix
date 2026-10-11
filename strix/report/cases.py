@@ -2,18 +2,55 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from strix.core.paths import runs_base_dir
 
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
 _CATALOG_FILE = "catalog-roots.json"
+_CATALOG_LOCK = ".catalog-roots.lock"
+_THREAD_LOCK = threading.Lock()
+_RUNTIME_EVIDENCE = re.compile(
+    r"runtime-(?:\d{8}-\d{6}-[0-9a-f]{8}|(?:launch|attach)-[0-9a-f]{32})\.jsonl\Z"
+)
+
+
+@contextmanager
+def _locked_catalog(base: Path) -> Iterator[None]:
+    """Serialize root registrations across local Strix processes."""
+    with _THREAD_LOCK, (base / _CATALOG_LOCK).open("a+b") as stream:
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt  # noqa: PLC0415
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl  # noqa: PLC0415
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True)
@@ -29,9 +66,19 @@ class CaseRun:
     target: str
     findings: int
 
+    @property
+    def selector(self) -> str:
+        """An opaque, stable selector even when registered roots reuse a run name."""
+        path = str(self.path.resolve())
+        if os.name == "nt":
+            path = path.casefold()
+        digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        return f"{self.run_id}~{digest}"
+
     def public(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "selector": self.selector,
             "case_id": self.case_id,
             "mode": self.mode,
             "parent_run_id": self.parent_run_id,
@@ -77,14 +124,18 @@ def add_catalog_root(path: Path, primary: Path | None = None) -> Path:
         candidate = candidate.parent
     if candidate == base:
         return candidate
-    roots = catalog_roots(base)
-    if candidate in roots:
-        return candidate
     base.mkdir(parents=True, exist_ok=True)
-    payload = {"schema": 1, "roots": [str(root) for root in [*roots[1:], candidate]]}
-    temporary = base / f".{_CATALOG_FILE}.{os.getpid()}.tmp"
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(base / _CATALOG_FILE)
+    with _locked_catalog(base):
+        roots = catalog_roots(base)
+        if candidate in roots:
+            return candidate
+        payload = {"schema": 1, "roots": [str(root) for root in [*roots[1:], candidate]]}
+        temporary = base / f".{_CATALOG_FILE}.{uuid4().hex}.tmp"
+        try:
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(base / _CATALOG_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
     return candidate
 
 
@@ -105,8 +156,8 @@ def _read_run(path: Path) -> CaseRun | None:
     record = _read_json(path / ("manifest.json" if legacy_blue else "run.json"))
     if not record:
         return None
-    # Directory names are the stable viewer selector. A run.json run_id may be
-    # an unrelated UUID, and two registered roots may contain the same name.
+    # Directory names are the displayed run ID. run.json may contain an unrelated
+    # UUID, and registered roots can reuse a name; CaseRun.selector disambiguates.
     run_id = path.name
     mode = "blue" if legacy_blue else str(record.get("mode") or "standard")
     if mode not in {"blue", "standard"}:
@@ -154,9 +205,13 @@ def list_case_runs(primary: Path | None = None) -> list[CaseRun]:
 
 
 def resolve_case_run(run_id: str, primary: Path | None = None) -> CaseRun | None:
-    if not run_id or any(char in run_id for char in ("/", "\\", "..")):
+    if not run_id or any(char in run_id for char in ("/", "\\")):
         return None
-    matches = [run for run in list_case_runs(primary) if run.run_id == run_id]
+    runs = list_case_runs(primary)
+    selected = [run for run in runs if run.selector == run_id]
+    if len(selected) == 1:
+        return selected[0]
+    matches = [run for run in runs if run.run_id == run_id]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -186,6 +241,9 @@ def list_case_handoffs(case_id: str, primary: Path | None = None) -> list[dict[s
                     {
                         "id": stage.name,
                         "parent_run_id": record["parent_run_id"],
+                        "parent_run_name": record.get("parent_run_name")
+                        if isinstance(record.get("parent_run_name"), str)
+                        else record["parent_run_id"],
                         "finding_refs": [ref for ref in refs if isinstance(ref, str)],
                         "scope": record.get("scope")
                         if isinstance(record.get("scope"), str)
@@ -247,7 +305,42 @@ def case_finding_locations(run: CaseRun, finding: dict[str, Any]) -> list[dict[s
         path = finding.get("code_file") or finding.get("target")
         if isinstance(path, str) and path:
             result.append({"path": path, "line": None, "sha256": hashes.get(path)})
+    if not result and isinstance(finding.get("source_sha256"), str):
+        # Binary findings have no source line. The saved digest provides an exact
+        # location only when it identifies one file in this run's manifest.
+        matches = [
+            path for path, digest in hashes.items()
+            if digest == finding["source_sha256"]
+        ]
+        if len(matches) == 1:
+            result.append(
+                {"path": matches[0], "line": None, "sha256": finding["source_sha256"]}
+            )
     return result
+
+
+def case_runtime_observation_counts(
+    case_id: str, primary: Path | None = None
+) -> dict[str, Any]:
+    """Count completed observations from the full saved log, not timeline tail."""
+    by_run: dict[str, int] = {}
+    for run in list_case_runs(primary):
+        if run.case_id != case_id or run.mode != "blue":
+            continue
+        count = 0
+        try:
+            with (run.path / "blue-events.jsonl").open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("kind") == "runtimeObservation":
+                        count += 1
+        except OSError:
+            pass
+        by_run[run.selector] = count
+    return {"total": sum(by_run.values()), "by_run": by_run}
 
 
 def event_time(value: Any, fallback: str = "") -> str:
@@ -282,16 +375,30 @@ def case_timeline(  # noqa: PLR0912, PLR0915
                     continue
                 if not isinstance(activity, dict):
                     continue
-                events.append(
-                    {
-                        "id": f"{run.run_id}:activity:{number}",
-                        "run_id": run.run_id,
-                        "mode": "blue",
-                        "timestamp": event_time(activity.get("timestamp"), run.started_at),
-                        "kind": str(activity.get("kind") or "activity"),
-                        "summary": str(activity.get("summary") or "Blue activity"),
-                    }
-                )
+                kind = str(activity.get("kind") or "activity")
+                summary = str(activity.get("summary") or "Blue activity")
+                event = {
+                    "id": f"{run.selector}:activity:{number}",
+                    "run_id": run.run_id,
+                    "run_selector": run.selector,
+                    "mode": "blue",
+                    "timestamp": event_time(activity.get("timestamp"), run.started_at),
+                    "kind": kind,
+                    "summary": summary,
+                }
+                if (
+                    kind in {"runtimeObservation", "runtimeObservationFailed"}
+                    and "evidence: " in summary
+                ):
+                    evidence_name = summary.rsplit("evidence: ", 1)[-1].strip()
+                    evidence_path = run.path / evidence_name
+                    if (
+                        _RUNTIME_EVIDENCE.fullmatch(evidence_name)
+                        and evidence_path.is_file()
+                        and not evidence_path.is_symlink()
+                    ):
+                        event["evidence_file"] = evidence_name
+                events.append(event)
             log = run.path / "codex-events.jsonl"
             try:
                 with log.open(encoding="utf-8") as source:
@@ -319,8 +426,9 @@ def case_timeline(  # noqa: PLR0912, PLR0915
                     continue
                 events.append(
                     {
-                        "id": f"{run.run_id}:blue:{number}",
+                        "id": f"{run.selector}:blue:{number}",
                         "run_id": run.run_id,
+                        "run_selector": run.selector,
                         "mode": "blue",
                         "timestamp": event_time(raw.get("emittedAtMs"), run.started_at),
                         "kind": method,
@@ -338,8 +446,9 @@ def case_timeline(  # noqa: PLR0912, PLR0915
                 kind = str(raw.get("type") or "event")
                 data = raw.get("data")
                 event = {
-                    "id": f"{run.run_id}:standard:{raw.get('id', index)}",
+                    "id": f"{run.selector}:standard:{raw.get('id', index)}",
                     "run_id": run.run_id,
+                    "run_selector": run.selector,
                     "mode": "standard",
                     "timestamp": event_time(raw.get("timestamp"), run.started_at),
                     "kind": kind,

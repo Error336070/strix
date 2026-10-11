@@ -91,9 +91,17 @@ func parseBlueAction(input string) (map[string]any, error) {
 func (m Model) updateBlue(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	observation := m.snapshot.BlueObservation
 	active := observation != nil && observation.Status == "running"
+	handoff := m.snapshot.BlueHandoff
+	if m.blueHandoffStage != blueHandoffNone && key.String() != "ctrl+o" &&
+		key.String() != "ctrl+c" && key.String() != "ctrl+q" {
+		return m.updateBlueHandoff(key)
+	}
 	switch key.String() {
+	case "ctrl+o":
+		return m, send(m.client, "viewer.open", map[string]any{})
 	case "ctrl+c", "ctrl+q":
-		if m.snapshot.ScanState == "running" || m.snapshot.ScanState == "preparing" || active {
+		if m.snapshot.ScanState == "running" || m.snapshot.ScanState == "preparing" || active ||
+			(handoff != nil && (handoff.Status == "staging" || handoff.Status == "launching")) {
 			m.errorText = "Blue is active. Wait for completion before closing the TUI."
 			return m, nil
 		}
@@ -107,7 +115,28 @@ func (m Model) updateBlue(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.blueActionStage = blueActionNone
 		m.input.SetValue("")
+		if handoff != nil && handoff.Status == "pending_stage" {
+			return m, send(m.client, "blue.handoff_close", map[string]any{})
+		}
 		return m, nil
+	case "j", "down", "k", "up":
+		if m.blueActionStage == blueActionNone && len(m.snapshot.BlueFindings) > 0 {
+			delta := 1
+			if key.String() == "k" || key.String() == "up" {
+				delta = -1
+			}
+			m.blueFindingIndex = (m.blueFindingIndex + delta + len(m.snapshot.BlueFindings)) % len(m.snapshot.BlueFindings)
+			return m, nil
+		}
+	case "h":
+		if m.snapshot.ScanState == "completed" && !active && m.blueActionStage == blueActionNone && len(m.snapshot.BlueFindings) > 0 &&
+			(handoff == nil || (handoff.Status != "pending_stage" && handoff.Status != "staging" && handoff.Status != "launching")) {
+			m.blueHandoffStage = blueHandoffCommand
+			m.input.SetValue("")
+			m.input.Focus()
+			m.errorText = ""
+			return m, nil
+		}
 	case "o":
 		if m.snapshot.ScanState == "completed" && !active && m.blueActionStage == blueActionNone && (observation == nil || observation.Status != "pending") {
 			m.blueActionStage = blueActionCommand

@@ -57,23 +57,25 @@ type Hello struct {
 }
 
 type BluePreview struct {
-	Target         string         `json:"target"`
-	Manifest       string         `json:"manifest"`
-	CaseID         string         `json:"case_id"`
-	FileCount      int            `json:"file_count"`
-	TotalBytes     int64          `json:"total_bytes"`
-	ScopeSHA256    string         `json:"scope_sha256"`
-	FirstPath      string         `json:"first_path"`
-	FirstSHA256    string         `json:"first_sha256"`
-	IncludedFiles  []string       `json:"included_files"`
-	RemainingFiles int            `json:"remaining_files"`
-	Operations     []string       `json:"operations"`
-	Sandbox        map[string]any `json:"sandbox"`
-	Model          string         `json:"model"`
-	Provider       string         `json:"provider"`
-	Approval       string         `json:"approval"`
-	Endpoint       *string        `json:"endpoint"`
-	PeAudit        map[string]any `json:"pe_audit"`
+	Target              string         `json:"target"`
+	Manifest            string         `json:"manifest"`
+	CaseID              string         `json:"case_id"`
+	FileCount           int            `json:"file_count"`
+	TotalBytes          int64          `json:"total_bytes"`
+	ScopeSHA256         string         `json:"scope_sha256"`
+	ManifestSHA256      string         `json:"manifest_sha256"`
+	FirstPath           string         `json:"first_path"`
+	FirstSHA256         string         `json:"first_sha256"`
+	IncludedFiles       []string       `json:"included_files"`
+	RemainingFiles      int            `json:"remaining_files"`
+	Operations          []string       `json:"operations"`
+	Sandbox             map[string]any `json:"sandbox"`
+	Model               string         `json:"model"`
+	Provider            string         `json:"provider"`
+	Approval            string         `json:"approval"`
+	Endpoint            *string        `json:"endpoint"`
+	PeAudit             map[string]any `json:"pe_audit"`
+	BinaryWithoutHelper bool           `json:"binary_without_helper"`
 }
 
 type BlueObservation struct {
@@ -95,6 +97,40 @@ type BlueObservation struct {
 	ResultStatus     string  `json:"result_status"`
 	ElapsedSeconds   float64 `json:"elapsed_seconds"`
 	ExitCode         *int    `json:"exit_code"`
+}
+
+type BlueFinding struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Severity     string `json:"severity"`
+	SourceSHA256 string `json:"source_sha256"`
+}
+
+type BlueHandoff struct {
+	Status          string   `json:"status"`
+	Phrase          string   `json:"phrase"`
+	FindingID       string   `json:"finding_id"`
+	FindingTitle    string   `json:"finding_title"`
+	FindingSeverity string   `json:"finding_severity"`
+	FindingEvidence string   `json:"finding_evidence"`
+	FindingSHA256   string   `json:"finding_sha256"`
+	SourceSHA256    string   `json:"source_sha256"`
+	ManifestSHA256  string   `json:"manifest_sha256"`
+	FindingsSHA256  string   `json:"findings_sha256"`
+	SnapshotSHA256  string   `json:"snapshot_sha256"`
+	ReviewSHA256    string   `json:"review_sha256"`
+	Target          string   `json:"target"`
+	Snapshot        string   `json:"snapshot"`
+	Scope           string   `json:"scope"`
+	Questions       []string `json:"questions"`
+	Model           *string  `json:"model"`
+	Endpoint        *string  `json:"endpoint"`
+	LaunchReady     bool     `json:"launch_ready"`
+	StagePath       string   `json:"stage_path"`
+	StagedTarget    string   `json:"staged_target"`
+	RecordSHA256    string   `json:"record_sha256"`
+	StandardPID     *int     `json:"standard_pid"`
+	Error           string   `json:"error"`
 }
 
 type Snapshot struct {
@@ -126,6 +162,8 @@ type Snapshot struct {
 	Error               *string          `json:"error"`
 	BluePreview         *BluePreview     `json:"blue_preview"`
 	BlueObservation     *BlueObservation `json:"blue_observation"`
+	BlueFindings        []BlueFinding    `json:"blue_findings"`
+	BlueHandoff         *BlueHandoff     `json:"blue_handoff"`
 	ProjectionTruncated bool             `json:"projection_truncated"`
 }
 

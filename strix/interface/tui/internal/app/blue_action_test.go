@@ -94,6 +94,18 @@ func TestBlueActionBlocksQuitWhileObservationRuns(t *testing.T) {
 	}
 }
 
+func TestBlueRunCanOpenSharedViewer(t *testing.T) {
+	model, connection := newCommandTestModel(t)
+	model.snapshot = protocol.Snapshot{
+		SetupMode: false, ScanStarted: true, ScanState: "completed",
+		BluePreview: &protocol.BluePreview{ScopeSHA256: strings.Repeat("b", 64)},
+	}
+	_, cmd := model.updateMain(tea.KeyMsg{Type: tea.KeyCtrlO})
+	if got := commandFromCmd(t, cmd, connection); got.Type != "viewer.open" {
+		t.Fatalf("Blue Ctrl+O sent %s instead of opening the shared viewer", got.Type)
+	}
+}
+
 func TestBlueGrantRequiresOperatorObserveAndPreviewEnter(t *testing.T) {
 	model, connection := newCommandTestModel(t)
 	model.snapshot = protocol.Snapshot{SetupMode: false, ScanStarted: true, ScanState: "completed", BluePreview: &protocol.BluePreview{ScopeSHA256: strings.Repeat("b", 64)}}

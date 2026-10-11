@@ -14,10 +14,13 @@ Design notes:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import mimetypes
+import re
 import secrets
+import shutil
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -38,6 +41,7 @@ from strix.interface.viewer.transcript import (
 )
 from strix.report.cases import (
     case_finding_locations,
+    case_runtime_observation_counts,
     case_timeline,
     catalog_roots,
     list_case_handoffs,
@@ -51,6 +55,14 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+class _InvalidBodyError(ValueError):
+    pass
+
+
+class _BodyTooLargeError(ValueError):
+    pass
 
 
 def bundle_dir() -> Path:
@@ -71,11 +83,12 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
     return run_dirs
 
 
-def run_list_entry(run_dir: Path) -> dict[str, Any]:
+def run_list_entry(run_dir: Path, *, selector: str | None = None) -> dict[str, Any]:
     """Compact summary of a single run for the history list."""
     record = read_run_summary(run_dir)
     entry = {
         "name": record.get("run_name") or run_dir.name,
+        "selector": selector or run_dir.name,
         "target": primary_target(record),
         "scan_mode": record.get("scan_mode"),
         "status": record.get("status"),
@@ -87,6 +100,8 @@ def run_list_entry(run_dir: Path) -> dict[str, Any]:
     entry["mode"] = record.get("mode") or "standard"
     entry["case_id"] = record.get("case_id") or entry["name"]
     entry["parent_run_id"] = record.get("parent_run_id")
+    refs = record.get("finding_refs")
+    entry["finding_refs"] = refs if isinstance(refs, list) else []
     return entry
 
 
@@ -99,7 +114,7 @@ def build_runs_payload(base_dir: Path, *, verified: bool) -> dict[str, Any]:
     return {
         "locked": False,
         "count": count,
-        "runs": [run_list_entry(run.path) for run in runs],
+        "runs": [run_list_entry(run.path, selector=run.selector) for run in runs],
     }
 
 
@@ -145,8 +160,8 @@ class _ViewerState:
         # for the operator who started the server (see ``authorized_url``), and
         # exchanged for a session cookie only when presented on the initial page
         # load. It is the request-level authorization the review asked for:
-        # reachability of the port (e.g. when bound with ``--host``) is not
-        # enough to read run data, steer a live scan, trigger a report, or
+        # reachability of the local port is not enough to read run data,
+        # steer a live scan, trigger a report, or
         # browse history -- the token is never handed to a caller who merely
         # reaches ``/``.
         self.session_token = secrets.token_urlsafe(32)
@@ -158,6 +173,7 @@ class _ViewerState:
 def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
     class ViewerHandler(BaseHTTPRequestHandler):
         server_version = "StrixViewer/1.0"
+        _MAX_BODY_BYTES = 64 * 1024
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             logger.debug("viewer %s - %s", self.address_string(), format % args)
@@ -179,7 +195,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 logger.exception("viewer request failed: %s", path)
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
-        def do_POST(self) -> None:
+        def do_POST(self) -> None:  # noqa: PLR0912
             path = urlsplit(self.path).path
             try:
                 if not self._same_origin_browser_post():
@@ -201,6 +217,12 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                     self._handle_steer()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+            except _BodyTooLargeError:
+                self.close_connection = True
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "body_too_large"})
+            except _InvalidBodyError:
+                self.close_connection = True
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_body"})
             except BrokenPipeError:
                 logger.debug("viewer client disconnected during POST %s", path)
             except Exception:
@@ -209,7 +231,14 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
         def _read_body(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError as exc:
+                raise _InvalidBodyError from exc
+            if length < 0:
+                raise _InvalidBodyError
+            if length > self._MAX_BODY_BYTES:
+                raise _BodyTooLargeError
             raw = self.rfile.read(length) if length else b""
             try:
                 body = json.loads(raw or b"{}")
@@ -225,6 +254,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         )
 
         def _handle_event(self) -> None:
+            if not self._has_session():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
             body = self._read_body()
             # Forwarded as anonymous PostHog events that respect the global
             # telemetry opt-out. Never forward the email, code, or report body:
@@ -248,7 +280,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
 
-        def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:  # noqa: PLR0912
+        def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:  # noqa: PLR0911, PLR0912
             # The local session capability grants access to all registered runs.
             # Reaching the HTTP port alone never grants access to their data.
             if path == "/api/runs":
@@ -259,6 +291,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, payload)
                 return
             if path == "/api/capabilities":
+                if not self._has_session():
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
                 # Steering is only possible when the viewer shares a live scan's
                 # coordinator + event loop (the TUI launcher wires a handler).
                 self._send_json(
@@ -275,7 +310,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
             # All remaining GET endpoints expose run metadata or scan output.
             # Require the capability even for the run used to launch the viewer;
-            # reachability of an exposed --host port must not grant data access.
+            # reachability of the local port must not grant data access.
             if not self._has_session():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
@@ -288,22 +323,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 return
 
             if path == "/api/case":
-                selected = next(
-                    (item for item in list_case_runs(state.base_dir) if item.path == run_dir), None
-                )
+                catalog = list_case_runs(state.base_dir)
+                selected = next((item for item in catalog if item.path == run_dir), None)
                 case_id = selected.case_id if selected else run_dir.name
-                members = [
-                    member.public()
-                    for member in list_case_runs(state.base_dir)
-                    if member.case_id == case_id
-                ]
+                members = [member.public() for member in catalog if member.case_id == case_id]
                 findings = []
-                for member in list_case_runs(state.base_dir):
+                for member in catalog:
                     if member.case_id != case_id:
                         continue
                     findings.extend(
                         {
                             "run_id": member.run_id,
+                            "run_selector": member.selector,
                             "id": finding.get("id"),
                             "title": finding.get("title"),
                             "severity": finding.get("severity"),
@@ -322,6 +353,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                         "runs": members,
                         "findings": findings,
                         "handoffs": list_case_handoffs(case_id, state.base_dir),
+                        "runtime_observations": case_runtime_observation_counts(
+                            case_id, state.base_dir
+                        ),
                     },
                 )
             elif path == "/api/case/timeline":
@@ -341,13 +375,38 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, {"markdown": read_report_markdown(run_dir)})
             elif path == "/api/transcript":
                 self._send_json(HTTPStatus.OK, build_run_state(run_dir))
+            elif path == "/api/case/evidence":
+                self._send_runtime_evidence(run_dir, (query.get("file") or [""])[0])
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+
+        def _send_runtime_evidence(self, run_dir: Path, filename: str) -> None:
+            if not re.fullmatch(r"runtime-[A-Za-z0-9_-]+\.jsonl", filename):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_evidence_file"})
+                return
+            if not (run_dir / "manifest.json").is_file():
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown evidence"})
+                return
+            evidence = run_dir / filename
+            if (
+                evidence.is_symlink()
+                or evidence.resolve().parent != run_dir.resolve()
+                or not evidence.is_file()
+            ):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown evidence"})
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(evidence.stat().st_size))
+            self.end_headers()
+            with evidence.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile)
 
         def _handle_auth_status(self) -> None:
             # The cached verified email is only disclosed to a caller holding this
             # process's session capability, so a cookie-less client on an exposed
-            # --host port cannot read it; everyone else looks unverified.
+            # port cannot read it; everyone else looks unverified.
             # Verification is reported through is_verified() so an expired record
             # is advertised as unverified -- otherwise the SPA would suppress
             # re-verification while history stays locked, stranding the user.
@@ -403,8 +462,8 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
         def _handle_forget(self) -> None:
             # Clearing the cached verification is a state change, so it requires
-            # this process's session capability: a cookie-less caller on an
-            # exposed --host port must not be able to log the operator out.
+            # this process's session capability: a cookie-less caller must
+            # not be able to log the operator out.
             if not self._has_session():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
@@ -456,7 +515,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
 
         def _handle_feedback(self) -> None:
             # Requires this process's session capability, like the other POSTs,
-            # so an exposed --host port can't be used to spam the relay.
+            # so a caller without the local session can't spam the relay.
             if not self._has_session():
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
                 return
@@ -564,8 +623,7 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             """True when the request carries the correct bootstrap token.
 
             The token reaches the operator's browser through the URL printed /
-            opened by the process that started the server, a channel an
-            arbitrary network caller on an exposed port cannot observe.
+            opened by the process that started the server.
             """
             supplied = (query.get("token") or [""])[0]
             return bool(supplied) and secrets.compare_digest(supplied, state.session_token)
@@ -626,8 +684,7 @@ def authorized_url(base_url: str, token: str) -> str:
 
     Presenting ``token`` on the initial page load is what mints the session
     cookie, so this URL is printed / opened only for the operator who started
-    the server. Sharing it (rather than the bare ``base_url``) is what lets a
-    trusted remote user authorize when the viewer is exposed with ``--host``.
+    the server. Keep it private because it authorizes local run access.
     """
     return f"{base_url}/?{urlencode({'token': token})}"
 
@@ -653,22 +710,31 @@ def serve(
     the live scan process and can forward a message to a running agent. Left
     ``None`` (standalone ``strix view``), steering is reported unavailable.
     """
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError("The local viewer can bind only to a loopback address.")
+    bind_host = "127.0.0.1" if host == "localhost" else host
+
     assets_dir = bundle_dir()
     state = _ViewerState(run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler)
     handler = _make_handler(state)
 
     try:
-        httpd = ThreadingHTTPServer((host, port), handler)
+        httpd = ThreadingHTTPServer((bind_host, port), handler)
     except OSError:
         if port == 0:
             raise
         logger.info("viewer port %s unavailable, falling back to an ephemeral port", port)
-        httpd = ThreadingHTTPServer((host, 0), handler)
+        httpd = ThreadingHTTPServer((bind_host, 0), handler)
 
     httpd.daemon_threads = True
     bound_port = int(httpd.server_address[1])
     state.cookie_name = f"{SESSION_COOKIE_PREFIX}_{bound_port}"
-    url = f"http://{host}:{bound_port}"
+    url_host = f"[{bind_host}]" if ":" in bind_host else bind_host
+    url = f"http://{url_host}:{bound_port}"
 
     thread = threading.Thread(target=httpd.serve_forever, name="strix-viewer", daemon=True)
     thread.start()

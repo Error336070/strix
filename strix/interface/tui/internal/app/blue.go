@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/usestrix/strix/tui/internal/protocol"
 	"github.com/usestrix/strix/tui/internal/render"
 )
 
@@ -41,7 +42,7 @@ func (m Model) bluePreviewView(width int) string {
 	inner := max(12, width-4)
 	rows := []string{
 		render.Bold(lightBlue).Render("Blue scope preview"),
-		render.Col(amber).Render("Type RUN " + preview.ScopeSHA256[:min(8, len(preview.ScopeSHA256))] + " to start"),
+		render.Col(amber).Render("Type RUN " + preview.ManifestSHA256[:min(8, len(preview.ManifestSHA256))] + " to start"),
 		render.Dim().Render("Target: ") + render.Col(white).Render(truncatePath(preview.Target, inner-8)),
 		render.Dim().Render(fmt.Sprintf("%d files · %d bytes · case %s", preview.FileCount, preview.TotalBytes, preview.CaseID)),
 		render.Dim().Render("Route: ") + render.Col(white).Render(truncatePath(preview.Provider+" / "+preview.Model+" · approval "+preview.Approval, inner-7)),
@@ -53,8 +54,16 @@ func (m Model) bluePreviewView(width int) string {
 	}
 	if toolPath, ok := preview.PeAudit["path"].(string); ok {
 		rows = append(rows, render.Dim().Render("PE helper: ")+render.Col(white).Render(truncatePath(toolPath, inner-11)))
+		rows = append(rows, render.Col(amber).Render("PE helper is executable code; review its path and hash."))
+		if toolHash, ok := preview.PeAudit["sha256"].(string); ok {
+			rows = append(rows, blueHashRows("PE helper SHA-256", toolHash, inner)...)
+		}
+	}
+	if preview.BinaryWithoutHelper {
+		rows = append(rows, render.Col(amber).Render("PE files present without a pinned helper; binary inspection will be limited."))
 	}
 	rows = append(rows, blueHashRows("Scope SHA-256 (all manifest entries)", preview.ScopeSHA256, inner)...)
+	rows = append(rows, blueHashRows("Review SHA-256 (manifest and settings)", preview.ManifestSHA256, inner)...)
 	rows = append(rows, render.Dim().Render("Included files:"))
 	visible := min(len(preview.IncludedFiles), max(2, m.height-22))
 	for _, path := range preview.IncludedFiles[:visible] {
@@ -82,8 +91,25 @@ func (m Model) blueRunView() string {
 		render.Bold(lightBlue).Render("Strix Blue"),
 		render.Col(white).Render("Status: " + m.snapshot.ScanState),
 	}
+	handoffActive := m.snapshot.BlueHandoff != nil &&
+		m.snapshot.BlueHandoff.Status != "launched" && m.snapshot.BlueHandoff.Status != "stage_failed"
+	if m.snapshot.ScanState == "completed" && !handoffActive {
+		if count := len(m.snapshot.BlueFindings); count > 0 {
+			index := min(m.blueFindingIndex, count-1)
+			finding := m.snapshot.BlueFindings[index]
+			rows = append(rows,
+				render.Col(white).Render(fmt.Sprintf("Finding %d/%d: %s [%s] %s", index+1, count, finding.ID, finding.Severity, truncate(finding.Title, inner-25))),
+				render.Dim().Render("j/k select finding · h investigate in Standard"),
+			)
+		} else {
+			rows = append(rows, render.Dim().Render("No structured Blue findings recorded for handoff"))
+		}
+	}
 	observation := m.snapshot.BlueObservation
-	if observation == nil {
+	if handoffActive {
+		// The handoff review has its own target, hashes, and scope. Keep it in view
+		// on a standard terminal instead of duplicating the run summary here.
+	} else if observation == nil {
 		rows = append(rows,
 			render.Dim().Render(fmt.Sprintf("%d files · %d bytes", preview.FileCount, preview.TotalBytes)),
 			render.Col(white).Render(truncatePath(preview.Target, inner)),
@@ -139,6 +165,48 @@ func (m Model) blueRunView() string {
 	if m.snapshot.Error != nil {
 		rows = append(rows, render.Col(red).Render(truncate(*m.snapshot.Error, width-4)))
 	}
+	if handoff := m.snapshot.BlueHandoff; handoff != nil {
+		rows = append(rows, render.Bold(lightBlue).Render("Investigate in Standard: "+handoff.Status))
+		switch handoff.Status {
+		case "pending_stage":
+			rows = append(rows,
+				render.Col(white).Render(truncate(handoff.FindingID+" · "+handoff.FindingTitle, inner)),
+				render.Dim().Render("Scope: ")+render.Col(white).Render(truncate(handoff.Scope, inner-7)),
+				render.Dim().Render("Route: ")+render.Col(white).Render(handoffRoute(handoff)),
+				render.Dim().Render("Snapshot: ")+render.Col(white).Render(truncatePath(handoff.Snapshot, inner-10)),
+			)
+			rows = append(rows, blueHashRows("Source file SHA-256", handoff.SourceSHA256, inner)...)
+			rows = append(rows, blueHashRows("Finding evidence SHA-256", handoff.FindingSHA256, inner)...)
+			rows = append(rows, blueHashRows("Blue findings artifact SHA-256", handoff.FindingsSHA256, inner)...)
+			rows = append(rows, blueHashRows("Review SHA-256 (scope and route)", handoff.ReviewSHA256, inner)...)
+			rows = append(rows,
+				render.Col(amber).Render("Type "+handoff.Phrase+" to stage a target copy"),
+				render.Dim().Render("Esc cancels without staging or launching Standard"),
+			)
+		case "staging", "launching":
+			rows = append(rows, render.Dim().Render("Waiting for the reviewed handoff action to finish"))
+		case "staged":
+			rows = append(rows,
+				render.Dim().Render("Staged target: ")+render.Col(white).Render(truncatePath(handoff.StagedTarget, inner-15)),
+			)
+			rows = append(rows, blueHashRows("Staged record SHA-256", handoff.RecordSHA256, inner)...)
+			if handoff.LaunchReady {
+				rows = append(rows,
+					render.Col(white).Render("Local Standard route: "+handoffRoute(handoff)),
+					render.Col(amber).Render("Type "+handoff.Phrase+" to launch Standard in a new console"),
+					render.Dim().Render("Esc keeps the staged copy without launching"),
+				)
+			} else {
+				rows = append(rows, render.Col(amber).Render("Staged only. Configure a local Standard model and endpoint before launch."))
+			}
+		case "launched":
+			if handoff.StandardPID != nil {
+				rows = append(rows, render.Col(green).Render(fmt.Sprintf("Standard started in a new console · PID %d", *handoff.StandardPID)))
+			}
+		case "stage_failed":
+			rows = append(rows, render.Col(red).Render(truncate(handoff.Error, inner)))
+		}
+	}
 	if m.errorText != "" {
 		rows = append(rows, render.Col(amber).Render(truncate(m.errorText, width-4)))
 	}
@@ -149,6 +217,14 @@ func (m Model) blueRunView() string {
 			m.input.View(),
 		)
 	} else if m.blueActionStage == blueActionConfirm {
+		rows = append(rows, m.input.View())
+	} else if m.blueHandoffStage == blueHandoffCommand {
+		rows = append(rows,
+			render.Dim().Render("/handoff --scope \"NEW SCOPE\" [--question \"QUESTION\"]"),
+			render.Dim().Render("Optional: --model openai/MODEL --endpoint http://127.0.0.1:PORT/v1"),
+			m.input.View(),
+		)
+	} else if m.blueHandoffStage == blueHandoffStageConfirm || m.blueHandoffStage == blueHandoffLaunchConfirm {
 		rows = append(rows, m.input.View())
 	} else if m.snapshot.ScanState == "completed" && (observation == nil || observation.Status == "completed" || observation.Status == "failed") {
 		rows = append(rows, render.Dim().Render("Press o to prepare one runtime observation"))
@@ -162,4 +238,11 @@ func (m Model) blueRunView() string {
 		Border(lipgloss.RoundedBorder()).BorderForeground(lightBlue).
 		Render(strings.Join(rows, "\n"))
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+}
+
+func handoffRoute(handoff *protocol.BlueHandoff) string {
+	if handoff.Model == nil || handoff.Endpoint == nil {
+		return "stage only (no local Standard endpoint)"
+	}
+	return *handoff.Model + " · " + *handoff.Endpoint
 }

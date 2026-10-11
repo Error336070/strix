@@ -59,10 +59,19 @@ type modalMode int
 
 type blueActionStage int
 
+type blueHandoffStage int
+
 const (
 	blueActionNone blueActionStage = iota
 	blueActionCommand
 	blueActionConfirm
+)
+
+const (
+	blueHandoffNone blueHandoffStage = iota
+	blueHandoffCommand
+	blueHandoffStageConfirm
+	blueHandoffLaunchConfirm
 )
 
 const (
@@ -105,6 +114,8 @@ type Model struct {
 	vulnViewport           viewport.Model
 	modal                  modalMode
 	blueActionStage        blueActionStage
+	blueHandoffStage       blueHandoffStage
+	blueFindingIndex       int
 	focus                  focusMode
 	options                []string
 	filtered               []string

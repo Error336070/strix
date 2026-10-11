@@ -70,6 +70,25 @@ def test_confirmation_phrase_binds_evidence_path_and_timeout(tmp_path: Path) -> 
     assert first != runtime.launch_confirmation_phrase(permit, tmp_path / "first.jsonl", 6)
 
 
+def test_boolean_timeout_and_pid_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    permit = _fixture(tmp_path)
+    monkeypatch.setattr(runtime, "_require_windows", lambda: None)
+    invalid_timeout = bool(1)
+    with pytest.raises(runtime.RuntimeObservationError, match="Observation time"):
+        runtime.launch_confirmation_phrase(permit, tmp_path / "events.jsonl", invalid_timeout)
+    with pytest.raises(runtime.RuntimeObservationError, match="attach request"):
+        runtime.observe_runtime(
+            permit,
+            mode="attach",
+            pid=True,
+            evidence_path=tmp_path / "events.jsonl",
+            risk_acknowledged=True,
+        )
+    assert not (tmp_path / "events.jsonl").exists()
+
+
 def test_launch_writes_process_events_with_no_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -163,6 +182,88 @@ def test_launch_timeout_terminates_only_started_process(
         "launched_process_kill_requested",
         "launched_process_exited_after_kill",
     ]
+
+
+def test_observation_window_starts_after_process_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    permit = _fixture(tmp_path)
+    evidence = tmp_path / "events.jsonl"
+    phrase = runtime.launch_confirmation_phrase(permit, evidence, 0.125)
+    monkeypatch.setattr(runtime, "_require_windows", lambda: None)
+    clock = [0.0]
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock[0])
+
+    def advance_clock(seconds: float) -> None:
+        clock[0] += seconds
+
+    monkeypatch.setattr(runtime.time, "sleep", advance_clock)
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, *, timeout: int) -> int:
+            assert timeout == 2
+            return 1
+
+    def slow_spawn(*_args: object, **_kwargs: object) -> FakeProcess:
+        clock[0] += 8.0
+        return FakeProcess()
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", slow_spawn)
+    result = runtime.observe_runtime(
+        permit,
+        mode="launch",
+        evidence_path=evidence,
+        timeout_seconds=0.125,
+        confirmation_phrase=phrase,
+        risk_acknowledged=True,
+    )
+    events = [json.loads(line)["event"] for line in evidence.read_text().splitlines()]
+    assert "process_alive" in events
+    assert result.elapsed_seconds == 0.125
+
+
+def test_timeout_with_unconfirmed_cleanup_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    permit = _fixture(tmp_path)
+    evidence = tmp_path / "events.jsonl"
+    phrase = runtime.launch_confirmation_phrase(permit, evidence, 0.1)
+    monkeypatch.setattr(runtime, "_require_windows", lambda: None)
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, *, timeout: int) -> None:
+            raise runtime.subprocess.TimeoutExpired("owned.exe", timeout)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *_a, **_k: FakeProcess())
+    with pytest.raises(runtime.RuntimeObservationError, match="could not be confirmed"):
+        runtime.observe_runtime(
+            permit,
+            mode="launch",
+            evidence_path=evidence,
+            timeout_seconds=0.1,
+            confirmation_phrase=phrase,
+            risk_acknowledged=True,
+        )
+    events = [json.loads(line)["event"] for line in evidence.read_text().splitlines()]
+    assert "launched_process_kill_wait_timed_out" in events
+    assert "observation_failed" in events
+    assert events[-1] == "launched_process_cleanup_unconfirmed"
 
 
 def test_evidence_creation_race_prevents_launch(

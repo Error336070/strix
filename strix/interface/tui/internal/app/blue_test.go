@@ -71,22 +71,39 @@ func TestBlueRunKeepsOwningTUIOpen(t *testing.T) {
 	}
 }
 
+func TestBluePreviewWarnsWhenPEHelperIsMissing(t *testing.T) {
+	model := New(nil)
+	model.snapshot = protocol.Snapshot{
+		SetupMode: true,
+		BluePreview: &protocol.BluePreview{
+			ScopeSHA256:         strings.Repeat("a", 64),
+			ManifestSHA256:      strings.Repeat("b", 64),
+			BinaryWithoutHelper: true,
+		},
+	}
+	if view := ansi.Strip(model.bluePreviewView(80)); !strings.Contains(view, "binary inspection will be limited") {
+		t.Fatal("Blue preview did not warn about missing PE helper")
+	}
+}
+
 func TestBluePreviewBindsConfirmationToScope(t *testing.T) {
 	model, connection := newCommandTestModel(t)
 	firstHash := strings.Repeat("a", 64)
 	scopeHash := strings.Repeat("b", 64)
+	manifestHash := strings.Repeat("c", 64)
 	model.snapshot = protocol.Snapshot{
 		SetupMode: true,
 		BluePreview: &protocol.BluePreview{
 			Target:    `C:\Owned Fixture\sample.dll`,
 			Manifest:  `C:\runs\blue\manifest.json`,
 			FileCount: 1, TotalBytes: 128,
-			ScopeSHA256: scopeHash, FirstPath: "sample.dll", FirstSHA256: firstHash,
+			ScopeSHA256: scopeHash, ManifestSHA256: manifestHash,
+			FirstPath: "sample.dll", FirstSHA256: firstHash,
 			IncludedFiles: []string{"sample.dll"}, Operations: []string{"static-read", "analysis", "report"},
 		},
 	}
 	view := ansi.Strip(model.bluePreviewView(80))
-	for _, want := range []string{scopeHash, firstHash, "sample.dll", "static-read", "no tool network", "RUN bbbbbbbb"} {
+	for _, want := range []string{scopeHash, manifestHash, firstHash, "sample.dll", "static-read", "no tool network", "RUN cccccccc"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Blue preview omitted %q", want)
 		}
@@ -94,16 +111,16 @@ func TestBluePreviewBindsConfirmationToScope(t *testing.T) {
 	model.width, model.height = 80, 24
 	model.resizeViewport()
 	screen := ansi.Strip(model.setupView())
-	for _, want := range []string{scopeHash, firstHash, "sample.dll", "RUN bbbbbbbb"} {
+	for _, want := range []string{scopeHash, manifestHash, firstHash, "sample.dll", "RUN cccccccc"} {
 		if !strings.Contains(screen, want) {
 			t.Fatalf("Blue setup screen omitted %q at 80x24", want)
 		}
 	}
 	updated, cmd := model.submit("RUN aaaaaaaa")
-	if cmd != nil || !strings.Contains(updated.(Model).setupContent(), "RUN bbbbbbbb") {
+	if cmd != nil || !strings.Contains(updated.(Model).setupContent(), "RUN cccccccc") {
 		t.Fatal("first-file hash incorrectly confirmed the full scope")
 	}
-	_, cmd = model.submit("RUN bbbbbbbb")
+	_, cmd = model.submit("RUN cccccccc")
 	if got := commandFromCmd(t, cmd, connection).Type; got != "setup.blue_confirm" {
 		t.Fatalf("command = %s, want setup.blue_confirm", got)
 	}

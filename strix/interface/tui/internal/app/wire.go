@@ -32,6 +32,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		update.State.Vulnerabilities = m.snapshot.Vulnerabilities
 		update.State.Agents = m.snapshot.Agents
 		oldObservation := m.snapshot.BlueObservation
+		oldHandoff := m.snapshot.BlueHandoff
 		m.consumeMessages(update.State.Messages, update.State.SetupMode)
 		m.snapshot = update.State
 		m.stateRevision = update.Revision
@@ -65,6 +66,31 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			m.blueActionStage = blueActionNone
 			m.input.SetValue("")
 		}
+		if handoff := m.snapshot.BlueHandoff; handoff != nil {
+			if handoff.Status == "pending_stage" && (oldHandoff == nil || oldHandoff.Status != "pending_stage") {
+				m.blueHandoffStage = blueHandoffStageConfirm
+				m.input.SetValue("")
+				m.input.Placeholder = "Type the exact STAGE phrase"
+				m.input.Focus()
+			} else if handoff.Status == "staged" && handoff.LaunchReady &&
+				(oldHandoff == nil || oldHandoff.Status != "staged") {
+				m.blueHandoffStage = blueHandoffLaunchConfirm
+				m.input.SetValue("")
+				m.input.Placeholder = "Type the exact STANDARD phrase"
+				m.input.Focus()
+			} else if handoff.Status != "pending_stage" && handoff.Status != "staged" {
+				m.blueHandoffStage = blueHandoffNone
+			}
+		} else if m.blueHandoffStage != blueHandoffCommand {
+			m.blueHandoffStage = blueHandoffNone
+		}
+		switch m.blueHandoffStage {
+		case blueHandoffStageConfirm:
+			m.input.Placeholder = "Type the exact STAGE phrase"
+		case blueHandoffLaunchConfirm:
+			m.input.Placeholder = "Type the exact STANDARD phrase"
+		}
+		m.blueFindingIndex = min(m.blueFindingIndex, max(0, len(m.snapshot.BlueFindings)-1))
 		m.selectedAgent = selectedAgentIndex(m.snapshot.Agents, selectedAgentID)
 		m.selectedVuln = min(m.selectedVuln, max(0, len(m.snapshot.Vulnerabilities)-1))
 		if m.modal == modalStop && !m.selectedAgentCanStop() {

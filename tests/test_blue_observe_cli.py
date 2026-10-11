@@ -86,3 +86,17 @@ def test_observe_requires_completed_run_before_approval(
 def test_observe_attach_requires_pid(tmp_path: Path) -> None:
     manifest = _prepared_exe(tmp_path)
     assert blue.run_blue(["observe", str(manifest), "--mode", "attach"]) == 2
+
+
+def test_observe_rejects_nonfinite_timeout_before_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _prepared_exe(tmp_path)
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("Invalid timeout must not prompt")
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        blue.run_blue(
+            ["observe", str(manifest), "--mode", "attach", "--pid", "1", "--timeout", "nan"]
+        )
+    assert exit_info.value.code == 2

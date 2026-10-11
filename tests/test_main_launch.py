@@ -70,6 +70,16 @@ def test_direct_launch_verifies_the_model_before_the_tui(monkeypatch: pytest.Mon
     assert _launch(monkeypatch, needs_setup=False) == ["bootstrap", "tui"]
 
 
+def test_root_help_uses_strix_name_even_from_python_c(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["-c", "--help"])
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.main()
+    assert exit_info.value.code == 0
+    assert "usage: strix " in capsys.readouterr().out
+
+
 def test_start_screen_launch_defers_the_model_check_to_the_tui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

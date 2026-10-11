@@ -154,6 +154,7 @@ export interface RunSeverityCounts {
 
 export interface RunListEntry {
   name: string;
+  selector: string;
   mode: "blue" | "standard";
   case_id: string;
   parent_run_id: string | null;
@@ -169,6 +170,7 @@ export interface RunListEntry {
 
 export interface CaseRun {
   run_id: string;
+  selector: string;
   case_id: string;
   mode: "blue" | "standard";
   parent_run_id: string | null;
@@ -182,15 +184,18 @@ export interface CaseRun {
 export interface CaseEvent {
   id: string;
   run_id: string;
+  run_selector: string;
   mode: "blue" | "standard";
   timestamp: string;
   kind: string;
   summary: string;
   finding_id?: string;
+  evidence_file?: string;
 }
 
 export interface CaseFinding {
   run_id: string;
+  run_selector: string;
   id: string;
   title: string;
   severity: string;
@@ -207,6 +212,11 @@ export interface CaseHandoff {
   files: { path: string; sha256: string }[];
   launch_ready: boolean;
   created_at: string;
+}
+
+export interface RuntimeObservationCounts {
+  total: number;
+  by_run: Record<string, number>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -238,18 +248,26 @@ function parseCaseHandoffs(value: unknown): CaseHandoff[] {
 function parseCaseRuns(value: unknown): CaseRun[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) => {
-    if (!isRecord(entry) || typeof entry.run_id !== "string") return [];
+    if (!isRecord(entry) || typeof entry.run_id !== "string" || typeof entry.selector !== "string") return [];
     return [{
-      ...entry,
+      run_id: entry.run_id,
+      selector: entry.selector,
+      case_id: typeof entry.case_id === "string" ? entry.case_id : "",
+      mode: entry.mode === "blue" ? "blue" : "standard",
+      parent_run_id: typeof entry.parent_run_id === "string" ? entry.parent_run_id : null,
       finding_refs: Array.isArray(entry.finding_refs) ? entry.finding_refs.filter((ref): ref is string => typeof ref === "string") : [],
-    } as CaseRun];
+      status: typeof entry.status === "string" ? entry.status : "unknown",
+      started_at: typeof entry.started_at === "string" ? entry.started_at : "",
+      target: typeof entry.target === "string" ? entry.target : "",
+      findings: typeof entry.findings === "number" ? entry.findings : 0,
+    }];
   });
 }
 
 function parseCaseFindings(value: unknown): CaseFinding[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) => {
-    if (!isRecord(entry) || typeof entry.run_id !== "string" || typeof entry.id !== "string") return [];
+    if (!isRecord(entry) || typeof entry.run_id !== "string" || typeof entry.run_selector !== "string" || typeof entry.id !== "string") return [];
     const locations = Array.isArray(entry.locations) ? entry.locations.flatMap((location) =>
       isRecord(location) && typeof location.path === "string"
         ? [{ path: location.path, line: typeof location.line === "number" ? location.line : null,
@@ -258,6 +276,7 @@ function parseCaseFindings(value: unknown): CaseFinding[] {
     ) : [];
     return [{
       run_id: entry.run_id,
+      run_selector: entry.run_selector,
       id: entry.id,
       title: typeof entry.title === "string" ? entry.title : "Untitled finding",
       severity: typeof entry.severity === "string" ? entry.severity : "unknown",
@@ -267,15 +286,19 @@ function parseCaseFindings(value: unknown): CaseFinding[] {
   });
 }
 
-export async function fetchCase(runName?: string | null): Promise<{ case_id: string; runs: CaseRun[]; findings: CaseFinding[]; handoffs: CaseHandoff[] }> {
+export async function fetchCase(runName?: string | null): Promise<{ case_id: string; runs: CaseRun[]; findings: CaseFinding[]; handoffs: CaseHandoff[]; runtime_observations: RuntimeObservationCounts }> {
   const value = await getJson("/api/case" + runQuery(runName));
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid case response");
   const record = value as Record<string, unknown>;
+  const aggregate = isRecord(record.runtime_observations) ? record.runtime_observations : {};
+  const rawByRun = isRecord(aggregate.by_run) ? aggregate.by_run : {};
+  const byRun = Object.fromEntries(Object.entries(rawByRun).filter((entry): entry is [string, number] => typeof entry[1] === "number"));
   return {
     case_id: typeof record.case_id === "string" ? record.case_id : "",
     runs: parseCaseRuns(record.runs),
     findings: parseCaseFindings(record.findings),
     handoffs: parseCaseHandoffs(record.handoffs),
+    runtime_observations: { total: typeof aggregate.total === "number" ? aggregate.total : 0, by_run: byRun },
   };
 }
 

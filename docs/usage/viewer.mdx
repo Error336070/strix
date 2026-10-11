@@ -8,7 +8,7 @@ Every scan writes its results to disk as it runs. `strix view` serves those file
 ```bash
 strix view                                    # the most recent run
 strix view my-run-name                        # a specific run under ./strix_runs
-strix view --host 0.0.0.0 --port 8080 --no-open
+strix view --port 8080 --no-open
 ```
 
 The UI ships prebuilt with Strix, so there is no extra install or JavaScript build step. It reads run files from the configured local runs directory. The viewer does not upload them. Model requests follow each run's configured provider.
@@ -20,7 +20,7 @@ The UI ships prebuilt with Strix, so there is no extra install or JavaScript bui
 </ParamField>
 
 <ParamField path="--host" type="string" default="127.0.0.1">
-  Host to bind to. Use `0.0.0.0` to reach the viewer from other machines.
+  Loopback address to bind to. The viewer rejects non-loopback addresses.
 </ParamField>
 
 <ParamField path="--port" type="number" default="0">
@@ -40,10 +40,12 @@ The UI ships prebuilt with Strix, so there is no extra install or JavaScript bui
 - **History** — browse past Blue and Standard runs on this machine and move between them. The local viewer token grants access; email verification is not required.
 - **Case workspace** — see linked runs, findings, and recorded activity for the selected case. Missing evidence is labeled as missing.
 
-## Sharing The Link
+## Local access
 
 <Warning>
-  The token in the printed URL grants access to the run data, and to the steering of a live scan. Share it only with trusted users.
+  The token in the printed URL grants access to the run data and, for a live in-TUI session, steering. Keep the link private.
 </Warning>
 
-To reach the viewer from another machine, start it with `--host 0.0.0.0` and replace `0.0.0.0` in the printed URL with a reachable IP address or hostname. Restrict the port with your firewall. A request without the token-derived session cannot read run data.
+The viewer listens only on the local machine. Opening the printed link establishes a browser session; requests without that session cannot read run data.
+
+Browser cookies are scoped to a host, not to a port. If you also open an untrusted web service on `127.0.0.1` in the same browser, that service may receive the viewer cookie. Close the viewer when finished, and avoid opening untrusted local services while its session is active.

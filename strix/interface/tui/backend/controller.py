@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import time
 import webbrowser
 from collections.abc import Awaitable, Callable
@@ -76,6 +77,8 @@ class TuiController:
         self._blue_grant: dict[str, Any] | None = None
         self._blue_observation_permit: Any = None
         self._blue_observation_task: asyncio.Task[None] | None = None
+        self.blue_findings: list[dict[str, Any]] = []
+        self.blue_handoff: dict[str, Any] | None = None
         self.scan_state = "setup" if self.setup_mode else "running"
         self.targets = [
             str(target["original"])
@@ -242,6 +245,12 @@ class TuiController:
             "blue_observation": terminal_projection(
                 self.blue_observation, max_string=2048, max_items=20
             ),
+            "blue_findings": terminal_projection(
+                self.blue_findings[:20], max_string=256, max_items=20
+            ),
+            "blue_handoff": terminal_projection(
+                self.blue_handoff, max_string=4096, max_items=30
+            ),
         }
         return bounded_state_projection(state)
 
@@ -312,6 +321,10 @@ class TuiController:
             "blue.observe_preview": self._blue_observe_preview,
             "blue.observe_confirm": self._blue_observe_confirm,
             "blue.observe_cancel": self._blue_observe_cancel,
+            "blue.handoff_preview": self._blue_handoff_preview,
+            "blue.handoff_stage": self._blue_handoff_stage,
+            "blue.handoff_launch": self._blue_handoff_launch,
+            "blue.handoff_close": self._blue_handoff_close,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
             "viewer.open": self._open_viewer,
@@ -434,6 +447,8 @@ class TuiController:
             Path(self._required_string(payload, "pe_audit"))
             if "pe_audit" in payload else None
         )
+        if pe_audit is None and os.environ.get("STRIX_PE_AUDIT_HELPER"):
+            pe_audit = Path(os.environ["STRIX_PE_AUDIT_HELPER"])
         from strix.core.paths import runs_base_dir
         from strix.interface.blue import BlueError, prepare_blue
 
@@ -452,12 +467,15 @@ class TuiController:
         finally:
             self._start_in_progress = False
         files = manifest["files"]
+        manifest_path = output / "manifest.json"
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         scope_sha256 = hashlib.sha256(
             json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         self.blue_preview = {
             "target": manifest["target"],
-            "manifest": str(output / "manifest.json"),
+            "manifest": str(manifest_path),
+            "manifest_sha256": manifest_sha256,
             "case_id": manifest["case_id"],
             "file_count": len(files),
             "total_bytes": sum(entry["size"] for entry in files),
@@ -473,6 +491,9 @@ class TuiController:
             "approval": manifest["approval"],
             "endpoint": manifest["endpoint"],
             "pe_audit": manifest["pe_audit"],
+            "binary_without_helper": manifest["pe_audit"] is None and any(
+                Path(entry["path"]).suffix.lower() in {".exe", ".dll"} for entry in files
+            ),
         }
         self._append_message(
             "Blue snapshot prepared. Review the scope and type its RUN phrase.", "info"
@@ -485,8 +506,11 @@ class TuiController:
         if preview is None:
             raise RuntimeError("No Blue preview is pending")
         phrase = self._required_string(payload, "phrase")
-        if phrase != f"RUN {preview['scope_sha256'][:8]}":
+        if phrase != f"RUN {preview['manifest_sha256'][:8]}":
             raise ValueError("Blue confirmation phrase does not match the preview")
+        current_digest = hashlib.sha256(Path(preview["manifest"]).read_bytes()).hexdigest()
+        if current_digest != preview["manifest_sha256"]:
+            raise ValueError("Blue manifest changed since preview; prepare a new run")
         self.setup_mode = False
         self.scan_started = True
         self.scan_state = "preparing"
@@ -499,16 +523,25 @@ class TuiController:
         self.scan_state = "running"
         self.notify_changed()
         try:
-            await asyncio.to_thread(
+            outcome = await asyncio.to_thread(
                 _run_prepared,
                 Path(manifest),
                 confirmed_phrase=f"RUN {preview['first_sha256'][:8]}",
+                expected_manifest_sha256=preview["manifest_sha256"],
             )
         except Exception as exc:  # noqa: BLE001 - the TUI needs the run failure
             self.error = str(exc)
             self.scan_state = "failed"
         else:
-            self.scan_state = "completed"
+            if outcome == "completed":
+                self.scan_state = "completed"
+                self._refresh_blue_findings(Path(manifest).parent)
+            elif outcome in {"failed", "interrupted"}:
+                self.scan_state = outcome
+                self.error = f"Blue analysis {outcome}; inspect the saved run evidence."
+            else:
+                self.scan_state = "failed"
+                self.error = f"Blue analysis returned unexpected status: {outcome!r}"
         self.notify_changed()
 
     async def _blue_cancel(self, _payload: dict[str, Any]) -> dict[str, Any]:
@@ -796,6 +829,233 @@ class TuiController:
         self._blue_observation_permit = None
         return {"cancelled": True}
 
+    def _refresh_blue_findings(self, output: Path) -> None:
+        try:
+            recorded = json.loads((output / "vulnerabilities.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = []
+        self.blue_findings = [
+            {
+                "id": item["id"],
+                "title": item.get("title", ""),
+                "severity": item.get("severity", ""),
+                "source_sha256": item.get("source_sha256", ""),
+            }
+            for item in recorded
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ][:100]
+
+    def _blue_handoff_review(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from strix.interface.blue_handoff import preview_handoff
+        from strix.interface.blue_local import validate_loopback_endpoint
+        from strix.report.cases import list_case_runs
+
+        manifest = self._completed_blue_manifest()
+        if self.blue_observation is not None and self.blue_observation["status"] == "running":
+            raise RuntimeError("Finish the runtime observation before handing off findings")
+        preview = self.blue_preview
+        assert preview is not None
+        output = Path(preview["manifest"]).parent
+        finding_id = self._required_string(payload, "finding_id")
+        scope = self._required_string(payload, "scope")
+        if len(scope) > 4096:
+            raise ValueError("Standard scope is too long")
+        questions = payload.get("questions", [])
+        if (
+            not isinstance(questions, list)
+            or len(questions) > 10
+            or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 1024
+                for item in questions
+            )
+        ):
+            raise ValueError("Questions must be at most ten non-empty short strings")
+        model = payload.get("model") or None
+        endpoint = payload.get("endpoint") or None
+        if bool(model) != bool(endpoint):
+            raise ValueError("Provide both a local Standard model and endpoint, or neither")
+        if model is not None:
+            if not isinstance(model, str) or not model.startswith("openai/") or len(model) <= 7:
+                raise ValueError("Standard's local model must use openai/MODEL")
+            if not isinstance(endpoint, str):
+                raise ValueError("Standard endpoint must be a loopback URL")
+            validate_loopback_endpoint(endpoint)
+        runs = [run for run in list_case_runs() if run.path.resolve() == output.resolve()]
+        if len(runs) != 1 or runs[0].mode != "blue":
+            raise ValueError("Completed Blue run is missing from the shared case catalog")
+        findings_path = output / "vulnerabilities.json"
+        findings_bytes = findings_path.read_bytes()
+        recorded = json.loads(findings_bytes)
+        if not isinstance(recorded, list):
+            raise TypeError("Blue findings artifact must be a list")
+        selected = [
+            item for item in recorded
+            if isinstance(item, dict) and item.get("id") == finding_id
+        ]
+        if len(selected) != 1:
+            raise ValueError("Select one recorded Blue finding")
+        finding = selected[0]
+        source_sha256 = finding.get("source_sha256")
+        if not isinstance(source_sha256, str) or source_sha256 not in {
+            item["sha256"] for item in manifest["files"]
+        }:
+            raise ValueError("Finding source hash does not match the reviewed snapshot")
+        finding_sha256 = hashlib.sha256(
+            json.dumps(finding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        review = {
+            "run_selector": runs[0].selector,
+            "case_id": runs[0].case_id,
+            "target": manifest["target"],
+            "snapshot": manifest["input_snapshot"],
+            "manifest_sha256": hashlib.sha256(Path(preview["manifest"]).read_bytes()).hexdigest(),
+            "findings_sha256": hashlib.sha256(findings_bytes).hexdigest(),
+            "snapshot_sha256": preview["scope_sha256"],
+            "finding_id": finding_id,
+            "finding_title": str(finding.get("title") or ""),
+            "finding_severity": str(finding.get("severity") or ""),
+            "finding_evidence": str(finding.get("evidence") or ""),
+            "finding_sha256": finding_sha256,
+            "source_sha256": source_sha256,
+            "scope": scope,
+            "questions": [item.strip() for item in questions],
+            "model": model,
+            "endpoint": endpoint,
+            "launch_ready": model is not None and endpoint is not None,
+        }
+        referenced = preview_handoff(
+            runs[0].selector, [finding_id], review["questions"], scope, model, endpoint
+        )
+        review["handoff_preview_sha256"] = referenced["preview_sha256"]
+        review["review_sha256"] = hashlib.sha256(
+            json.dumps(review, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return review
+
+    async def _blue_handoff_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.blue_handoff is not None and self.blue_handoff["status"] in {
+            "pending_stage", "staging", "launching"
+        }:
+            raise RuntimeError("Finish or close the current handoff first")
+        review = await asyncio.to_thread(self._blue_handoff_review, payload)
+        self.blue_handoff = {
+            **review,
+            "status": "pending_stage",
+            "phrase": f"STAGE {review['review_sha256'][:8]}",
+        }
+        return dict(self.blue_handoff)
+
+    async def _blue_handoff_stage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from strix.interface.blue_handoff import stage_handoff
+
+        handoff = self.blue_handoff
+        if handoff is None or handoff["status"] != "pending_stage":
+            raise RuntimeError("No reviewed handoff is pending")
+        if self._required_string(payload, "phrase") != handoff["phrase"]:
+            raise ValueError("Handoff staging phrase does not match the preview")
+        request = {
+            key: handoff[key] for key in ("finding_id", "scope", "questions", "model", "endpoint")
+        }
+        current = await asyncio.to_thread(self._blue_handoff_review, request)
+        if current["review_sha256"] != handoff["review_sha256"]:
+            raise ValueError("Blue evidence or handoff scope changed; request a new preview")
+        handoff["status"] = "staging"
+        self.notify_changed()
+        stage: Path | None = None
+        try:
+            stage, record = await asyncio.to_thread(
+                stage_handoff,
+                handoff["run_selector"], [handoff["finding_id"]],
+                handoff["questions"], handoff["scope"], handoff["model"],
+                handoff["endpoint"],
+                expected_preview_digest=handoff["handoff_preview_sha256"],
+            )
+            self._verify_staged_handoff(
+                record, handoff, self._completed_blue_manifest()["files"]
+            )
+            record_sha256 = hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest()
+        except Exception as exc:
+            if stage is not None:
+                self._discard_failed_handoff_stage(stage, record)
+            handoff.update(status="stage_failed", error=str(exc))
+            raise
+        handoff.update(
+            status="staged", stage_path=str(stage), staged_target=str(stage / "target"),
+            record_sha256=record_sha256,
+            phrase=f"STANDARD {record_sha256[:8]}" if handoff["launch_ready"] else "",
+        )
+        return dict(handoff)
+
+    @staticmethod
+    def _verify_staged_handoff(
+        record: dict[str, Any], handoff: dict[str, Any], files: list[dict[str, Any]]
+    ) -> None:
+        if (
+            record.get("files") != files
+            or record.get("scope") != handoff["scope"]
+            or record.get("standard_model") != handoff["model"]
+            or record.get("standard_endpoint") != handoff["endpoint"]
+        ):
+            raise ValueError("Staged handoff differs from reviewed Blue evidence")
+        staged_findings = record.get("findings")
+        if not isinstance(staged_findings, list) or len(staged_findings) != 1:
+            raise ValueError("Staged handoff has an unexpected finding count")
+        staged_hash = hashlib.sha256(
+            json.dumps(staged_findings[0], sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if staged_hash != handoff["finding_sha256"]:
+            raise ValueError("Staged finding differs from reviewed Blue evidence")
+
+    @staticmethod
+    def _discard_failed_handoff_stage(stage: Path, record: dict[str, Any]) -> None:
+        from strix.core.paths import runs_base_dir
+
+        root = (runs_base_dir() / "handoffs").resolve(strict=True)
+        if stage.is_symlink() or stage.resolve(strict=True).parent != root:
+            return
+        expected = {stage / "handoff.json"}
+        files = record.get("files", [])
+        if isinstance(files, list):
+            expected.update(
+                stage / "target" / item["path"]
+                for item in files
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            )
+        actual = {path for path in stage.rglob("*") if path.is_file() or path.is_symlink()}
+        if actual == expected and all(not path.is_symlink() for path in actual):
+            shutil.rmtree(stage)
+        else:
+            (stage / "handoff.json").replace(stage / "handoff.invalid.json")
+
+    async def _blue_handoff_launch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from strix.interface.blue_handoff import launch_staged_handoff
+
+        handoff = self.blue_handoff
+        if handoff is None or handoff["status"] != "staged" or not handoff["launch_ready"]:
+            raise RuntimeError("No launch-ready staged handoff is pending")
+        if self._required_string(payload, "phrase") != handoff["phrase"]:
+            raise ValueError("Standard launch phrase does not match the staged record")
+        handoff["status"] = "launching"
+        self.notify_changed()
+        try:
+            pid = await asyncio.to_thread(
+                launch_staged_handoff,
+                Path(handoff["stage_path"]), handoff["model"], handoff["endpoint"],
+                expected_hash=handoff["record_sha256"],
+            )
+        except Exception as exc:
+            handoff.update(status="staged", error=str(exc))
+            raise
+        handoff.update(status="launched", standard_pid=pid, phrase="")
+        return {"launched": True, "pid": pid, "stage_path": handoff["stage_path"]}
+
+    async def _blue_handoff_close(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        handoff = self.blue_handoff
+        if handoff is not None and handoff["status"] in {"staging", "launching"}:
+            raise RuntimeError("Wait for the handoff action to finish")
+        self.blue_handoff = None
+        return {"closed": handoff is not None}
+
     async def _send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = self._required_string(payload, "agent_id")
         message = self._required_string(payload, "message")
@@ -849,7 +1109,12 @@ class TuiController:
             with contextlib.suppress(Exception):
                 webbrowser.open(self.viewer_url)
             return {"status": "running", "url": self.viewer_url}
-        if self.report_state is None:
+        blue_run_dir = (
+            Path(self.blue_preview["manifest"]).parent
+            if self.blue_preview is not None and self.scan_started
+            else None
+        )
+        if self.report_state is None and blue_run_dir is None:
             self.viewer_status = "failed"
             return {"status": self.viewer_status, "error": "Scan output is not ready"}
         try:
@@ -877,10 +1142,16 @@ class TuiController:
                     wait_for_delivery=True,
                 )
 
+            run_dir = (
+                self.report_state.get_run_dir()
+                if self.report_state is not None
+                else blue_run_dir
+            )
+            assert run_dir is not None
             httpd, url, token = serve(
-                self.report_state.get_run_dir(),
+                run_dir,
                 open_browser=True,
-                steer_handler=steer,
+                steer_handler=steer if self.report_state is not None else None,
             )
             self._viewer_httpd = httpd
             self.viewer_url = authorized_url(url, token)
@@ -888,12 +1159,12 @@ class TuiController:
             with contextlib.suppress(Exception):
                 from strix.telemetry import posthog
 
-                live = self.report_state.run_record.get("status") not in {
-                    "completed",
-                    "stopped",
-                    "failed",
-                    "interrupted",
-                }
+                if self.report_state is None:
+                    live = self.scan_state in {"preparing", "running"}
+                else:
+                    live = self.report_state.run_record.get("status") not in {
+                        "completed", "stopped", "failed", "interrupted"
+                    }
                 posthog.viewer_opened(source="tui", live=live)
         except Exception:  # noqa: BLE001 - viewer startup failures must not crash the TUI
             self.viewer_status = "failed"

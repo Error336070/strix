@@ -47,7 +47,7 @@ def run_view(argv: list[str]) -> None:
     parser.add_argument(
         "--host",
         default="127.0.0.1",
-        help="Host to bind to (default: 127.0.0.1; use 0.0.0.0 for all IPv4 interfaces).",
+        help="Loopback address to bind to (default: 127.0.0.1).",
     )
     parser.add_argument(
         "--no-open",
@@ -67,12 +67,15 @@ def run_view(argv: list[str]) -> None:
 
     run_dir = _resolve_run_dir(args.run, console)
 
-    httpd, url, token = serve(
-        run_dir,
-        host=args.host,
-        port=args.port,
-        open_browser=not args.no_open,
-    )
+    try:
+        httpd, url, token = serve(
+            run_dir,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     # The tokened URL is what authorizes the browser (steering, report sending,
     # history). Print it rather than the bare URL so the operator -- and only
     # the operator -- can open or share an authorized link.
@@ -92,8 +95,8 @@ def run_view(argv: list[str]) -> None:
     # Print the URL alone on its own line with soft_wrap so Rich never inserts a
     # wrap into the (long, tokened) link -- that keeps it selectable/copyable.
     console.print(f"  [#60a5fa]{open_url}[/]", soft_wrap=True)
-    console.print("[dim]This link authorizes the browser; anyone you share it with can steer[/]")
-    console.print("[dim]a live scan and browse history. Press Ctrl-C to stop the viewer.[/]")
+    console.print("[dim]This link authorizes the local browser to browse history and[/]")
+    console.print("[dim]steer this runtime's live scan. Press Ctrl-C to stop the viewer.[/]")
     console.print()
 
     try:

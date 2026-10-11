@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from strix.core.paths import run_record_path
@@ -112,44 +111,75 @@ def read_report_markdown(run_dir: Path) -> str:
 def _blue_transcript(run_dir: Path) -> dict[str, Any]:
     """Project a Blue app-server trace into the viewer's existing transcript."""
     events: list[dict[str, Any]] = []
+    started_tools: dict[str, int] = {}
     log_path = run_dir / "codex-events.jsonl"
     try:
         with log_path.open(encoding="utf-8") as source:
-            lines = list(deque(source, maxlen=1000))
-    except OSError:
-        lines = []
-    for number, line in enumerate(lines):
-        try:
-            raw = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        method = raw.get("method")
-        if method not in {"item/started", "item/completed"}:
-            continue
-        params = raw.get("params")
-        item = params.get("item") if isinstance(params, dict) else None
-        if not isinstance(item, dict):
-            continue
-        kind = item.get("type")
-        if kind not in {"agentMessage", "dynamicToolCall"}:
-            continue
-        data = (
-            {"tool_name": item.get("name") or "read_scope_file", "status": "completed"}
-            if kind == "dynamicToolCall"
-            else {"content": item.get("text") or ""}
-        )
-        events.append(
-            {
-                "id": f"blue-{number}",
-                "type": "tool" if kind == "dynamicToolCall" else "chat",
-                "agent_id": "blue-codex",
-                "timestamp": event_time(raw.get("emittedAtMs")),
-                "version": 1,
-                "data": data,
-            }
-        )
+            for number, line in enumerate(source):
+                try:
+                    raw = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                method = raw.get("method")
+                if method not in {"item/started", "item/completed"}:
+                    continue
+                params = raw.get("params")
+                item = params.get("item") if isinstance(params, dict) else None
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("type")
+                item_id = item.get("id") or params.get("itemId")
+                stable_id = item_id if isinstance(item_id, str) and item_id else None
+                timestamp = event_time(raw.get("emittedAtMs"))
+
+                if kind == "agentMessage":
+                    if method == "item/completed":
+                        events.append(
+                            {
+                                "id": f"blue-{number}",
+                                "type": "chat",
+                                "agent_id": "blue-codex",
+                                "timestamp": timestamp,
+                                "version": 1,
+                                "data": {"content": item.get("text") or ""},
+                            }
+                        )
+                    continue
+                if kind != "dynamicToolCall":
+                    continue
+
+                name = item.get("name")
+                tool_name = name if isinstance(name, str) and name else "read_scope_file"
+                status = "running" if method == "item/started" else "completed"
+                item_status = item.get("status")
+                if (
+                    method == "item/completed"
+                    and isinstance(item_status, str)
+                    and item_status in {"failed", "error"}
+                ):
+                    status = "failed"
+                data = {"tool_name": tool_name, "status": status}
+                if stable_id and method == "item/completed" and stable_id in started_tools:
+                    index = started_tools.pop(stable_id)
+                    events[index]["data"] = data
+                    events[index]["version"] = 2
+                    continue
+                events.append(
+                    {
+                        "id": f"blue-{number}",
+                        "type": "tool",
+                        "agent_id": "blue-codex",
+                        "timestamp": timestamp,
+                        "version": 1,
+                        "data": data,
+                    }
+                )
+                if stable_id and method == "item/started":
+                    started_tools[stable_id] = len(events) - 1
+    except (OSError, UnicodeError):
+        pass
     return {
         "agents": [
             {
