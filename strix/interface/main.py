@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 _ROOT_SUBCOMMAND_HELP = """
 Additional commands:
+  strix blue ...           Audit authorized local software (experimental)
   strix cloud ...          Use the managed Strix platform
   strix auth ...           Manage model-subscription sign-in
   strix view [RUN]         View a completed or running scan
@@ -467,6 +468,11 @@ def main() -> None:
         from strix.interface.cloud import run_cloud
 
         sys.exit(run_cloud(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "blue":
+        from strix.interface.blue import run_blue
+
+        sys.exit(run_blue(sys.argv[2:]))
 
     start_import_warmup()
 

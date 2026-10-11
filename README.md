@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> This is an experimental personal fork for operator-led audits of authorized local software. The Blue command is under development on the `blue-mode` branch. The upstream Strix README below describes the original scan engine, not the Blue workflow. See [Blue mode](docs/blue-mode.md) for its current scope and limits.
+
+---
 <p align="center">
   <a href="https://strix.ai/">
     <img src="https://github.com/usestrix/.github/raw/main/imgs/cover.png" alt="Strix Banner" width="100%">
