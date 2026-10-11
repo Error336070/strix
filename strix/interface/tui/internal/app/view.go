@@ -283,6 +283,8 @@ func (m Model) viewInner() string {
 	main := m.mainView()
 	if m.snapshot.SetupMode {
 		main = m.setupView()
+	} else if m.snapshot.BluePreview != nil {
+		main = m.blueRunView()
 	}
 	if m.modal == modalConfirmMount {
 		// A corner prompt, not a dialog: it sits out of the way in the live view

@@ -272,7 +272,8 @@ export type SteerResult = { ok: true } | { ok: false; error: string };
 /** GET /api/capabilities. can_steer is true only inside a live in-TUI scan. */
 export async function fetchCapabilities(): Promise<Capabilities> {
   const obj = (await getJson("/api/capabilities")) as Partial<Capabilities>;
-  return { can_steer: obj?.can_steer === true };
+  const owner_run = typeof obj?.owner_run === "string" ? obj.owner_run : "";
+  return { can_steer: obj?.can_steer === true && owner_run.length > 0, owner_run };
 }
 
 /** POST /api/agents/steer. Sends a steering instruction to a running agent. */

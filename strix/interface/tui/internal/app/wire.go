@@ -31,6 +31,7 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 		update.State.Events = m.snapshot.Events
 		update.State.Vulnerabilities = m.snapshot.Vulnerabilities
 		update.State.Agents = m.snapshot.Agents
+		oldObservation := m.snapshot.BlueObservation
 		m.consumeMessages(update.State.Messages, update.State.SetupMode)
 		m.snapshot = update.State
 		m.stateRevision = update.Revision
@@ -44,8 +45,22 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			// splash before it.
 			m.showSplash = false
 			m.input.Placeholder = setupPlaceholder
+			if m.snapshot.BluePreview != nil {
+				m.input.Placeholder = "Type the RUN phrase or /blue cancel"
+			}
 		} else {
 			m.input.Placeholder = chatPlaceholder
+		}
+		if m.snapshot.BlueObservation != nil && m.snapshot.BlueObservation.Status == "pending" &&
+			(oldObservation == nil || oldObservation.Status != "pending") {
+			m.blueActionStage = blueActionConfirm
+			m.input.SetValue("")
+			m.input.Placeholder = "Type the exact action phrase"
+			m.input.Focus()
+		} else if m.blueActionStage == blueActionConfirm &&
+			(m.snapshot.BlueObservation == nil || m.snapshot.BlueObservation.Status != "pending") {
+			m.blueActionStage = blueActionNone
+			m.input.SetValue("")
 		}
 		m.selectedAgent = selectedAgentIndex(m.snapshot.Agents, selectedAgentID)
 		m.selectedVuln = min(m.selectedVuln, max(0, len(m.snapshot.Vulnerabilities)-1))

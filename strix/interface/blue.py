@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -99,7 +100,7 @@ def build_manifest(
     pe_audit: Path | None = None,
 ) -> dict[str, Any]:
     target = target.resolve(strict=True)
-    output = output.parent.resolve(strict=True) / output.name
+    output = output.parent.resolve(strict=False) / output.name
     if _contained(output, target) or _contained(target, output):
         raise BlueError("Output must be outside the target and its parent directories.")
     if output.exists():
@@ -168,6 +169,74 @@ def _copy_snapshot(manifest: dict[str, Any]) -> None:
             raise BlueError(f"Target changed while copying: {entry['path']}")
 
 
+def prepare_blue(
+    target: Path,
+    output: Path,
+    model: str = "gpt-6-sol",
+    approval: str = "deny",
+    provider: str = "codex",
+    endpoint: str | None = None,
+    case_id: str | None = None,
+    pe_audit: Path | None = None,
+) -> dict[str, Any]:
+    """Prepare the same hash-checked snapshot for CLI and TUI callers."""
+    manifest = build_manifest(
+        target, output, model, approval, provider, endpoint, case_id, pe_audit
+    )
+    output = Path(manifest["output"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=False)
+    _copy_snapshot(manifest)
+    _json(output / "manifest.json", manifest)
+    _event(output, "prepared", f"{len(manifest['files'])} files hash checked")
+    return manifest
+
+
+def discard_prepared_blue(manifest_path: Path, scope_sha256: str) -> None:
+    """Remove only a complete, unchanged TUI preview beneath the runs root."""
+    root = runs_base_dir().resolve(strict=True)
+    output = manifest_path.parent.resolve(strict=True)
+    if output.parent != root or manifest_path.resolve(strict=True) != output / "manifest.json":
+        raise BlueError("Prepared Blue output is outside the configured runs root.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = manifest.get("files")
+    if (
+        manifest.get("schema") != "strix-blue-local-v1"
+        or manifest.get("status") != "prepared"
+        or not isinstance(files, list)
+        or Path(manifest.get("output", "")).resolve() != output
+        or Path(manifest.get("input_snapshot", "")).resolve() != output / "inputs"
+    ):
+        raise BlueError("Blue preview changed; its evidence was left in place.")
+    digest = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    snapshot = output / "inputs"
+    if digest != scope_sha256 or inventory(snapshot) != files:
+        raise BlueError("Blue preview changed; its evidence was left in place.")
+    events = output / "blue-events.jsonl"
+    recorded = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    if len(recorded) != 1 or recorded[0].get("kind") != "prepared":
+        raise BlueError("Blue preview has additional events; its evidence was left in place.")
+    expected_files = {manifest_path, events} | {snapshot / entry["path"] for entry in files}
+    expected_dirs = {output, snapshot}
+    for file in expected_files:
+        expected_dirs.update(
+            parent for parent in file.parents if parent == output or output in parent.parents
+        )
+    actual = list(output.rglob("*"))
+    if any(path.is_symlink() or path.is_junction() for path in actual):
+        raise BlueError("Blue preview contains a link; its evidence was left in place.")
+    if {path for path in actual if path.is_file()} != expected_files or {
+        path for path in actual if path.is_dir()
+    } != expected_dirs - {output}:
+        raise BlueError("Blue preview has additional files; its evidence was left in place.")
+    for path in expected_files:
+        path.unlink()
+    for path in sorted(expected_dirs, key=lambda item: len(item.parts), reverse=True):
+        path.rmdir()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="strix blue", description="Operator-led audits of authorized local software"
@@ -193,6 +262,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     run = sub.add_parser("run", help="Recheck target hashes and start a prepared audit")
     run.add_argument("manifest", type=Path, help="Manifest written by prepare")
+    observe = sub.add_parser("observe", help="Observe an approved local PE process")
+    observe.add_argument("manifest", type=Path, help="Blue manifest for the target")
+    observe.add_argument("--mode", choices=("launch", "attach"), required=True)
+    observe.add_argument("--file", type=Path, help="Relative .exe path within a directory target")
+    observe.add_argument("--pid", type=int, help="Existing process ID for attach")
+    observe.add_argument(
+        "--timeout", type=float, default=5.0, help="Observation seconds (0.1 to 30)"
+    )
     handoff = sub.add_parser("handoff", help="Stage a reviewed Blue finding for Standard")
     handoff.add_argument("run", nargs="?", help="Blue run name in the shared catalog")
     handoff.add_argument("--finding", action="append", default=[], help="Recorded finding ID")
@@ -209,7 +286,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912, PLR0915
+def _run_prepared(  # noqa: PLR0912, PLR0915
+    manifest_path: Path, *, confirmed_phrase: str | None = None
+) -> None:
     manifest_path = manifest_path.absolute()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != "strix-blue-local-v1":
@@ -253,7 +332,12 @@ def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912, PLR0915
             "It does not enforce a target path allowlist."
         )
     phrase = f"RUN {manifest['files'][0]['sha256'][:8]}"
-    if input(f"Type {phrase} to start: ").strip() != phrase:
+    supplied = (
+        input(f"Type {phrase} to start: ").strip()
+        if confirmed_phrase is None
+        else confirmed_phrase
+    )
+    if supplied != phrase:
         raise BlueError("Run cancelled.")
     manifest["status"] = "running"
     _json(manifest_path, manifest)
@@ -281,6 +365,92 @@ def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912, PLR0915
     print(f"Run {manifest['status']}. Evidence: {output}")
 
 
+def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI validation flow
+    """Run one separately approved observation against a prepared Blue target."""
+    from strix.interface.blue_runtime import (  # noqa: PLC0415
+        WARNING,
+        TargetPermit,
+        launch_confirmation_phrase,
+        observe_runtime,
+    )
+
+    manifest_path = args.manifest.resolve(strict=True)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    output = Path(manifest["output"]).resolve(strict=True)
+    if manifest.get("schema") != "strix-blue-local-v1" or manifest_path != output / "manifest.json":
+        raise BlueError("Expected a Blue manifest in its declared output directory.")
+    target = Path(manifest["target"]).resolve(strict=True)
+    if inventory(target) != manifest["files"]:
+        raise BlueError("Target changed since preparation. Prepare a new Blue run.")
+    relative = args.file
+    if target.is_file():
+        if relative is not None:
+            raise BlueError("--file is only valid for a directory target.")
+        selected = target
+        entry = manifest["files"][0]
+        scope = target.parent
+    else:
+        if relative is None or relative.is_absolute() or ".." in relative.parts:
+            raise BlueError("A directory target requires a relative --file within its manifest.")
+        entry = next(
+            (item for item in manifest["files"] if Path(item["path"]) == relative), None
+        )
+        if entry is None:
+            raise BlueError("Selected file is not in the Blue manifest.")
+        selected = target / relative
+        scope = target
+    if args.mode == "launch" and args.pid is not None:
+        raise BlueError("--pid is only valid with --mode attach.")
+    if args.mode == "attach" and (args.pid is None or args.pid <= 0):
+        raise BlueError("Attach requires a positive --pid.")
+
+    evidence = output / f"runtime-{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(4)}.jsonl"
+    permit = TargetPermit(
+        scope_root=scope,
+        target=selected,
+        sha256=entry["sha256"],
+        allow_launch=args.mode == "launch",
+        allow_attach=args.mode == "attach",
+    )
+    phrase = (
+        launch_confirmation_phrase(permit, evidence, args.timeout)
+        if args.mode == "launch"
+        else f"ATTACH {args.pid} {entry['sha256'][:8]}"
+    )
+    print(f"Target: {selected}\nSHA-256 at path: {entry['sha256']}\nEvidence: {evidence}")
+    print(WARNING)
+    try:
+        supplied = input(f"Type {phrase} to approve this {args.mode}: ").strip()
+    except EOFError as exc:
+        raise BlueError("Runtime observation needs an interactive approval.") from exc
+    if supplied != phrase:
+        raise BlueError("Runtime observation cancelled.")
+    try:
+        result = observe_runtime(
+            permit,
+            mode=args.mode,
+            evidence_path=evidence,
+            timeout_seconds=args.timeout,
+            pid=args.pid,
+            confirmation_phrase=phrase if args.mode == "launch" else None,
+            risk_acknowledged=True,
+        )
+    except Exception:
+        if evidence.exists():
+            _event(
+                output,
+                "runtimeObservationFailed",
+                f"{args.mode} failed; evidence: {evidence.name}",
+            )
+        raise
+    _event(
+        output,
+        "runtimeObservation",
+        f"{args.mode} PID {result.pid}: {result.status}; evidence: {evidence.name}",
+    )
+    print(f"Runtime observation {result.status}. Evidence: {evidence}")
+
+
 def run_blue(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -289,9 +459,7 @@ def run_blue(argv: list[str]) -> int:
                 args.output
                 or runs_base_dir() / f"blue-{datetime.now(UTC):%Y%m%d-%H%M%S}-{os.getpid()}"
             )
-            if args.output is None:
-                output.parent.mkdir(parents=True, exist_ok=True)
-            manifest = build_manifest(
+            manifest = prepare_blue(
                 args.target,
                 output,
                 args.model,
@@ -301,15 +469,13 @@ def run_blue(argv: list[str]) -> int:
                 args.case_id,
                 args.pe_audit,
             )
-            output.mkdir(parents=True, exist_ok=False)
-            _copy_snapshot(manifest)
             path = output / "manifest.json"
-            _json(path, manifest)
-            _event(output, "prepared", f"{len(manifest['files'])} files hash checked")
             print(json.dumps(manifest, indent=2, ensure_ascii=False))
             print(f'\nRun when ready: strix blue run "{path.absolute()}"')
         elif args.command == "run":
             _run_prepared(args.manifest)
+        elif args.command == "observe":
+            _observe_prepared(args)
         else:
             from strix.interface.blue_handoff import run_handoff  # noqa: PLC0415
 

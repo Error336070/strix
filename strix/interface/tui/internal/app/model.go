@@ -57,6 +57,14 @@ func SetVersion(v string) {
 
 type modalMode int
 
+type blueActionStage int
+
+const (
+	blueActionNone blueActionStage = iota
+	blueActionCommand
+	blueActionConfirm
+)
+
 const (
 	modalNone modalMode = iota
 	modalHelp
@@ -96,6 +104,7 @@ type Model struct {
 	viewportContent        string
 	vulnViewport           viewport.Model
 	modal                  modalMode
+	blueActionStage        blueActionStage
 	focus                  focusMode
 	options                []string
 	filtered               []string

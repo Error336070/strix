@@ -11,7 +11,7 @@ strix view my-run-name                        # a specific run under ./strix_run
 strix view --host 0.0.0.0 --port 8080 --no-open
 ```
 
-The UI ships prebuilt with Strix, so there is no extra install and no JavaScript build step. The dashboard reads the run files straight off disk. Nothing leaves your machine, and you do not need a cloud account.
+The UI ships prebuilt with Strix, so there is no extra install or JavaScript build step. It reads run files from the configured local runs directory. The viewer does not upload them. Model requests follow each run's configured provider.
 
 ## Options
 
@@ -37,8 +37,8 @@ The UI ships prebuilt with Strix, so there is no extra install and no JavaScript
 - **Vulnerabilities** — each validated finding with its severity, details, and reproduction steps.
 - **Agent graph** — a live map of the multi-agent team, and what each agent is doing.
 - **Steering** — send instructions to a live scan to redirect the agents during the run. Steering works only in the dashboard the running scan opens. A standalone `strix view` has no live scan to steer.
-- **History** — browse past runs on this machine and move between them. Verify your email address in the dashboard to unlock the other runs.
-- **Reports** — generate a shareable report and send it by email. Verify your email address first.
+- **History** — browse past Blue and Standard runs on this machine and move between them. The local viewer token grants access; email verification is not required.
+- **Case workspace** — see linked runs, findings, and recorded activity for the selected case. Missing evidence is labeled as missing.
 
 ## Sharing The Link
 

@@ -180,5 +180,7 @@ def bounded_state_projection(state: dict[str, Any]) -> dict[str, Any]:
         "viewer_status": state["viewer_status"],
         "viewer_url": None,
         "error": terminal_projection(state["error"], max_string=256),
+        "blue_preview": state.get("blue_preview"),
+        "blue_observation": state.get("blue_observation"),
         "projection_truncated": True,
     }

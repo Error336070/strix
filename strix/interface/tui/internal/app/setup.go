@@ -31,6 +31,29 @@ func (m Model) submit(value string) (tea.Model, tea.Cmd) {
 // instruction, and the prompt alone is enough to launch. With no target, the
 // backend scans the current working directory.
 func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
+	if preview := m.snapshot.BluePreview; preview != nil {
+		if value == "/blue cancel" {
+			return *m, send(m.client, "setup.blue_cancel", map[string]any{})
+		}
+		phrase := "RUN " + preview.ScopeSHA256[:min(8, len(preview.ScopeSHA256))]
+		if value != phrase {
+			m.setupMsg("Review the Blue manifest, then type "+phrase+" or /blue cancel", render.Col(amber))
+			return *m, nil
+		}
+		return *m, send(m.client, "setup.blue_confirm", map[string]any{"phrase": value})
+	}
+	if value == "/blue" {
+		m.setupMsg("Use /blue PATH to prepare a local file or directory", render.Col(amber))
+		return *m, nil
+	}
+	if strings.HasPrefix(value, "/blue ") {
+		target := strings.Trim(strings.TrimSpace(strings.TrimPrefix(value, "/blue ")), "\"")
+		if target == "" {
+			m.setupMsg("Use /blue PATH to prepare a local file or directory", render.Col(amber))
+			return *m, nil
+		}
+		return *m, send(m.client, "setup.blue_prepare", map[string]any{"target": target})
+	}
 	var commands []tea.Cmd
 	fields := strings.Fields(value)
 	targets := 0
@@ -267,6 +290,9 @@ func (m Model) setupFit() setupFit {
 	if m.height < 18 {
 		fit.logo, fit.tagline = min(fit.logo, logoCompact), false
 	}
+	if m.snapshot.BluePreview != nil {
+		fit.logo, fit.tagline, fit.logRows = logoNone, false, 0
+	}
 	shrink := []func(*setupFit) bool{
 		func(f *setupFit) bool { return trimTo(&f.logRows, 3) },
 		func(f *setupFit) bool { return clearFlag(&f.tagline) },
@@ -343,10 +369,15 @@ func (m Model) setupBody(fit setupFit) string {
 		parts = append(parts, header)
 	}
 	parts = append(parts, m.setupComposer(fit.width))
+	if preview := m.bluePreviewView(fit.width); preview != "" {
+		parts = append(parts, preview)
+	}
 	if log := m.setupLogView(fit); log != "" {
 		parts = append(parts, log)
 	}
-	parts = append(parts, m.setupHintsView(fit.width))
+	if m.snapshot.BluePreview == nil {
+		parts = append(parts, m.setupHintsView(fit.width))
+	}
 	// Every row is padded to the column width: lipgloss.Place centers each line
 	// on its own, which would otherwise stagger the short rows.
 	rows := strings.Split(strings.Join(parts, "\n\n"), "\n")
@@ -432,6 +463,9 @@ func (m Model) setupComposer(width int) string {
 // setupSummaryView is the quiet meta line inside the panel: what the scan will
 // run as, or what is still missing before it can run.
 func (m Model) setupSummaryView(width int) string {
+	if preview := m.snapshot.BluePreview; preview != nil {
+		return truncate(render.Col(lightBlue).Render("Blue")+render.Dim().Render(" · "+preview.Model+" · "+preview.Approval+" approval"), max(1, width))
+	}
 	chips := []string{}
 	if model := strings.TrimSpace(m.snapshot.Model); model != "" {
 		name, provider := model, ""
@@ -497,6 +531,11 @@ func (m Model) setupHintsView(width int) string {
 	label := render.Dim().Render
 	hint := func(k, text string) string { return key(k) + label(" "+text) }
 	left := hint("enter", "launch scan") + label("   ") + hint("ctrl+c", "quit")
+	if m.snapshot.BluePreview != nil {
+		left = hint("enter", "confirm Blue phrase") + label("   ") + hint("/blue cancel", "close preview")
+	} else {
+		left += label("   ") + hint("/blue PATH", "preview local scope")
+	}
 	if lipgloss.Width(left) > inner {
 		left = hint("enter", "launch scan")
 	}

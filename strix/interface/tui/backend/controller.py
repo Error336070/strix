@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import math
+import os
 import webbrowser
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from strix.config import load_settings
 from strix.config.settings import DEFAULT_MAX_TURNS
@@ -63,6 +68,11 @@ class TuiController:
         self.setup_mode = bool(args.needs_setup)
         self.scan_started = not self.setup_mode
         self._start_in_progress = False
+        self.blue_preview: dict[str, Any] | None = None
+        self._blue_task: asyncio.Task[None] | None = None
+        self.blue_observation: dict[str, Any] | None = None
+        self._blue_observation_permit: Any = None
+        self._blue_observation_task: asyncio.Task[None] | None = None
         self.scan_state = "setup" if self.setup_mode else "running"
         self.targets = [
             str(target["original"])
@@ -224,6 +234,10 @@ class TuiController:
             "viewer_status": self.viewer_status,
             "viewer_url": terminal_projection(self.viewer_url, max_string=1024),
             "error": terminal_projection(self.error, max_string=2 * 1024),
+            "blue_preview": terminal_projection(self.blue_preview, max_string=1024, max_items=20),
+            "blue_observation": terminal_projection(
+                self.blue_observation, max_string=2048, max_items=20
+            ),
         }
         return bounded_state_projection(state)
 
@@ -288,6 +302,12 @@ class TuiController:
             "setup.set_instruction": self._set_instruction,
             "setup.start": self._start,
             "setup.confirm_mount": self._confirm_mount,
+            "setup.blue_prepare": self._blue_prepare,
+            "setup.blue_confirm": self._blue_confirm,
+            "setup.blue_cancel": self._blue_cancel,
+            "blue.observe_preview": self._blue_observe_preview,
+            "blue.observe_confirm": self._blue_observe_confirm,
+            "blue.observe_cancel": self._blue_observe_cancel,
             "agent.send_message": self._send_message,
             "agent.stop": self._stop_agent,
             "viewer.open": self._open_viewer,
@@ -318,6 +338,8 @@ class TuiController:
     async def _start(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.scan_started or self._start_in_progress:
             raise RuntimeError("Scan is already starting or running")
+        if self.blue_preview is not None:
+            raise RuntimeError("Confirm or cancel the Blue preview first")
         # Launching with no target mounts the working directory, so it requires
         # the user's explicit confirmation rather than happening silently.
         mount_working_dir = payload.get("mount_working_dir", False)
@@ -387,6 +409,272 @@ class TuiController:
         self.workspace_mount = mount if approved else None
         await self._begin_scan()
         return {"approved": approved}
+
+    async def _blue_prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_setup_mutable()
+        if self.blue_preview is not None:
+            raise RuntimeError("Confirm or cancel the current Blue preview first")
+        if self.targets:
+            raise RuntimeError("Clear Standard targets before preparing Blue")
+        target = Path(self._required_string(payload, "target"))
+        from strix.core.paths import runs_base_dir
+        from strix.interface.blue import BlueError, prepare_blue
+
+        output = runs_base_dir() / (
+            f"blue-{datetime.now(UTC):%Y%m%d-%H%M%S}-{os.getpid()}-{uuid4().hex[:8]}"
+        )
+        self._start_in_progress = True
+        try:
+            try:
+                manifest = await asyncio.to_thread(prepare_blue, target, output)
+            except BlueError as exc:
+                raise ValueError(str(exc)) from exc
+        finally:
+            self._start_in_progress = False
+        files = manifest["files"]
+        scope_sha256 = hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.blue_preview = {
+            "target": manifest["target"],
+            "manifest": str(output / "manifest.json"),
+            "case_id": manifest["case_id"],
+            "file_count": len(files),
+            "total_bytes": sum(entry["size"] for entry in files),
+            "scope_sha256": scope_sha256,
+            "first_path": files[0]["path"],
+            "first_sha256": files[0]["sha256"],
+            "included_files": [entry["path"] for entry in files[:8]],
+            "remaining_files": max(0, len(files) - 8),
+            "operations": manifest["operations"],
+            "sandbox": manifest["sandbox"],
+            "model": manifest["model"],
+            "provider": manifest["provider"],
+            "approval": manifest["approval"],
+        }
+        self._append_message(
+            "Blue snapshot prepared. Review the scope and type its RUN phrase.", "info"
+        )
+        return dict(self.blue_preview)
+
+    async def _blue_confirm(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_setup_mutable()
+        preview = self.blue_preview
+        if preview is None:
+            raise RuntimeError("No Blue preview is pending")
+        phrase = self._required_string(payload, "phrase")
+        if phrase != f"RUN {preview['scope_sha256'][:8]}":
+            raise ValueError("Blue confirmation phrase does not match the preview")
+        self.setup_mode = False
+        self.scan_started = True
+        self.scan_state = "preparing"
+        self._blue_task = asyncio.create_task(self._run_blue(preview["manifest"], preview))
+        return {"started": True, "manifest": preview["manifest"]}
+
+    async def _run_blue(self, manifest: str, preview: dict[str, Any]) -> None:
+        from strix.interface.blue import _run_prepared
+
+        self.scan_state = "running"
+        self.notify_changed()
+        try:
+            await asyncio.to_thread(
+                _run_prepared,
+                Path(manifest),
+                confirmed_phrase=f"RUN {preview['first_sha256'][:8]}",
+            )
+        except Exception as exc:  # noqa: BLE001 - the TUI needs the run failure
+            self.error = str(exc)
+            self.scan_state = "failed"
+        else:
+            self.scan_state = "completed"
+        self.notify_changed()
+
+    async def _blue_cancel(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_setup_mutable()
+        previous = self.blue_preview
+        if previous is not None:
+            from strix.interface.blue import BlueError, discard_prepared_blue
+
+            try:
+                await asyncio.to_thread(
+                    discard_prepared_blue, Path(previous["manifest"]), previous["scope_sha256"]
+                )
+            except BlueError as exc:
+                raise ValueError(str(exc)) from exc
+            self.blue_preview = None
+            self._append_message("Blue preview closed and its prepared snapshot removed.", "info")
+        return {"cancelled": previous is not None}
+
+    def _completed_blue_manifest(self) -> dict[str, Any]:
+        from strix.interface.blue import inventory
+
+        preview = self.blue_preview
+        if preview is None or self.setup_mode or self.scan_state != "completed":
+            raise RuntimeError("Finish a Blue run before requesting runtime observation")
+        path = Path(preview["manifest"])
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        files = manifest.get("files")
+        if (
+            manifest.get("schema") != "strix-blue-local-v1"
+            or manifest.get("status") != "completed"
+            or manifest.get("output") != str(path.parent)
+            or manifest.get("target") != preview["target"]
+            or manifest.get("input_snapshot") != str(path.parent / "inputs")
+            or not isinstance(files, list)
+            or hashlib.sha256(
+                json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            != preview["scope_sha256"]
+        ):
+            raise ValueError("Blue manifest changed or has not completed")
+        if inventory(path.parent / "inputs") != files:
+            raise ValueError("Blue snapshot changed since preparation")
+        return manifest
+
+    async def _blue_observe_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from strix.interface import blue_runtime
+
+        manifest = self._completed_blue_manifest()
+        if self.blue_observation is not None and self.blue_observation["status"] in {
+            "pending", "running"
+        }:
+            raise RuntimeError("Finish or cancel the current runtime request first")
+        mode = self._required_string(payload, "mode")
+        if mode not in {"launch", "attach"}:
+            raise ValueError("Runtime mode must be launch or attach")
+        relative_path = self._required_string(payload, "path")
+        entry = next((item for item in manifest["files"] if item["path"] == relative_path), None)
+        if entry is None:
+            raise ValueError("Runtime target must be an included Blue snapshot file")
+        try:
+            seconds = float(payload.get("timeout_seconds", 5.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Runtime timeout must be a number") from exc
+        if not 0.1 <= seconds <= 30.0:
+            raise ValueError("Runtime timeout must be between 0.1 and 30 seconds")
+        pid = payload.get("pid")
+        if mode == "attach":
+            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+                raise ValueError("Attach requires a positive PID")
+        elif pid is not None:
+            raise ValueError("Launch does not accept a PID")
+        output = Path(manifest["output"])
+        scope = Path(manifest["input_snapshot"])
+        permit = blue_runtime.TargetPermit(
+            scope_root=scope,
+            target=scope / relative_path,
+            sha256=entry["sha256"],
+            allow_launch=mode == "launch",
+            allow_attach=mode == "attach",
+        )
+        evidence = output / f"runtime-{mode}-{uuid4().hex}.jsonl"
+        try:
+            base_phrase = await asyncio.to_thread(
+                blue_runtime.launch_confirmation_phrase, permit, evidence, seconds
+            )
+        except blue_runtime.RuntimeObservationError as exc:
+            raise ValueError(str(exc)) from exc
+        phrase = base_phrase
+        if mode == "attach":
+            bound = json.dumps([base_phrase, pid, "attach"], separators=(",", ":"))
+            phrase = "ATTACH " + hashlib.sha256(bound.encode("utf-8")).hexdigest()[:20].upper()
+        self._blue_observation_permit = permit
+        self.blue_observation = {
+            "status": "pending",
+            "mode": mode,
+            "path": str(permit.target),
+            "sha256": permit.sha256,
+            "timeout_seconds": seconds,
+            "pid": pid,
+            "evidence": str(evidence),
+            "warning": blue_runtime.WARNING,
+            "phrase": phrase,
+        }
+        return dict(self.blue_observation)
+
+    async def _blue_observe_confirm(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from strix.interface import blue_runtime
+
+        request = self.blue_observation
+        permit = self._blue_observation_permit
+        if request is None or request["status"] != "pending" or permit is None:
+            raise RuntimeError("No runtime observation is pending")
+        phrase = self._required_string(payload, "phrase")
+        if phrase != request["phrase"]:
+            raise ValueError("Runtime confirmation phrase does not match this request")
+        self._completed_blue_manifest()
+        try:
+            base_phrase = await asyncio.to_thread(
+                blue_runtime.launch_confirmation_phrase,
+                permit,
+                Path(request["evidence"]),
+                request["timeout_seconds"],
+            )
+        except blue_runtime.RuntimeObservationError as exc:
+            raise ValueError(str(exc)) from exc
+        expected = base_phrase
+        if request["mode"] == "attach":
+            bound = json.dumps([base_phrase, request["pid"], "attach"], separators=(",", ":"))
+            expected = "ATTACH " + hashlib.sha256(bound.encode("utf-8")).hexdigest()[:20].upper()
+        if phrase != expected:
+            raise ValueError("Runtime target or evidence changed since preview")
+        request["status"] = "running"
+        request.pop("phrase", None)
+        self._blue_observation_task = asyncio.create_task(
+            self._run_blue_observation(permit, dict(request), phrase)
+        )
+        return {"started": True, "evidence": request["evidence"]}
+
+    async def _run_blue_observation(
+        self, permit: Any, request: dict[str, Any], phrase: str
+    ) -> None:
+        from strix.interface import blue_runtime
+        from strix.interface.blue import _event
+
+        try:
+            result = await asyncio.to_thread(
+                blue_runtime.observe_runtime,
+                permit,
+                mode=request["mode"],
+                evidence_path=Path(request["evidence"]),
+                timeout_seconds=request["timeout_seconds"],
+                pid=request["pid"],
+                confirmation_phrase=phrase if request["mode"] == "launch" else None,
+                risk_acknowledged=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - report failure beside the evidence path
+            assert self.blue_observation is not None
+            self.blue_observation.update(status="failed", error=str(exc))
+            if Path(request["evidence"]).is_file():
+                _event(
+                    Path(request["evidence"]).parent,
+                    "runtimeObservationFailed",
+                    f"{request['mode']} failed; evidence: {Path(request['evidence']).name}",
+                )
+        else:
+            assert self.blue_observation is not None
+            self.blue_observation.update(
+                status="completed",
+                result_status=result.status,
+                pid=result.pid,
+                elapsed_seconds=result.elapsed_seconds,
+                exit_code=result.exit_code,
+            )
+            _event(
+                Path(request["evidence"]).parent,
+                "runtimeObservation",
+                f"{request['mode']} PID {result.pid}: {result.status}; "
+                f"evidence: {Path(request['evidence']).name}",
+            )
+        self._blue_observation_permit = None
+        self.notify_changed()
+
+    async def _blue_observe_cancel(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        if self.blue_observation is None or self.blue_observation["status"] != "pending":
+            raise RuntimeError("No runtime observation is pending")
+        self.blue_observation = None
+        self._blue_observation_permit = None
+        return {"cancelled": True}
 
     async def _send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = self._required_string(payload, "agent_id")
@@ -503,10 +791,13 @@ class TuiController:
             httpd.server_close()
 
     async def _quit(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        if self._blue_observation_task is not None and not self._blue_observation_task.done():
+            raise RuntimeError("Runtime observation is active; wait for it to finish")
         self.close_viewer()
         if self._on_quit is not None:
             await self._on_quit()
-        self.scan_state = "stopped"
+        if self._blue_task is None or self._blue_task.done():
+            self.scan_state = "stopped"
         return {"quitting": True}
 
     @staticmethod

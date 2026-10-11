@@ -56,6 +56,40 @@ type Hello struct {
 	Capabilities []string `json:"capabilities"`
 }
 
+type BluePreview struct {
+	Target         string         `json:"target"`
+	Manifest       string         `json:"manifest"`
+	CaseID         string         `json:"case_id"`
+	FileCount      int            `json:"file_count"`
+	TotalBytes     int64          `json:"total_bytes"`
+	ScopeSHA256    string         `json:"scope_sha256"`
+	FirstPath      string         `json:"first_path"`
+	FirstSHA256    string         `json:"first_sha256"`
+	IncludedFiles  []string       `json:"included_files"`
+	RemainingFiles int            `json:"remaining_files"`
+	Operations     []string       `json:"operations"`
+	Sandbox        map[string]any `json:"sandbox"`
+	Model          string         `json:"model"`
+	Provider       string         `json:"provider"`
+	Approval       string         `json:"approval"`
+}
+
+type BlueObservation struct {
+	Status         string  `json:"status"`
+	Mode           string  `json:"mode"`
+	Path           string  `json:"path"`
+	SHA256         string  `json:"sha256"`
+	TimeoutSeconds float64 `json:"timeout_seconds"`
+	PID            *int    `json:"pid"`
+	Evidence       string  `json:"evidence"`
+	Warning        string  `json:"warning"`
+	Phrase         string  `json:"phrase"`
+	Error          string  `json:"error"`
+	ResultStatus   string  `json:"result_status"`
+	ElapsedSeconds float64 `json:"elapsed_seconds"`
+	ExitCode       *int    `json:"exit_code"`
+}
+
 type Snapshot struct {
 	SetupMode           bool             `json:"setup_mode"`
 	ScanStarted         bool             `json:"scan_started"`
@@ -82,6 +116,8 @@ type Snapshot struct {
 	ViewerStatus        string           `json:"viewer_status"`
 	ViewerURL           *string          `json:"viewer_url"`
 	Error               *string          `json:"error"`
+	BluePreview         *BluePreview     `json:"blue_preview"`
+	BlueObservation     *BlueObservation `json:"blue_observation"`
 	ProjectionTruncated bool             `json:"projection_truncated"`
 }
 

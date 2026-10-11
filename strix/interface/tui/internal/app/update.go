@@ -9,6 +9,9 @@ import (
 )
 
 func (m Model) updateMain(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.snapshot.BluePreview != nil && !m.snapshot.SetupMode {
+		return m.updateBlue(key)
+	}
 	switch key.String() {
 	case "f1":
 		m.openModal(modalHelp)
