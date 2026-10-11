@@ -69,6 +69,7 @@ func TestBlueHandoffRequiresTwoDistinctConfirmations(t *testing.T) {
 		BlueHandoff: &protocol.BlueHandoff{
 			Status: "pending_stage", Phrase: "STAGE abcdef12",
 			FindingID: "F-1", FindingTitle: "Owned finding", Scope: "Review source",
+			Questions: []string{"Is the finding reproducible?"},
 			SourceSHA256: strings.Repeat("a", 64), FindingSHA256: strings.Repeat("b", 64),
 			FindingsSHA256: strings.Repeat("c", 64), ReviewSHA256: strings.Repeat("d", 64),
 		},
@@ -79,7 +80,7 @@ func TestBlueHandoffRequiresTwoDistinctConfirmations(t *testing.T) {
 	if lines := strings.Count(view, "\n") + 1; lines > model.height {
 		t.Fatalf("handoff preview uses %d lines in a %d-line terminal", lines, model.height)
 	}
-	for _, want := range []string{"F-1", "Review source", strings.Repeat("a", 64), strings.Repeat("d", 64), "STAGE abcdef12"} {
+	for _, want := range []string{"F-1", "Review source", "Is the finding reproducible?", strings.Repeat("a", 64), strings.Repeat("d", 64), "STAGE abcdef12"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("handoff preview omitted %q", want)
 		}
@@ -95,11 +96,20 @@ func TestBlueHandoffRequiresTwoDistinctConfirmations(t *testing.T) {
 		BluePreview: &protocol.BluePreview{},
 		BlueHandoff: &protocol.BlueHandoff{
 			Status: "staged", Phrase: "STANDARD 98765432", LaunchReady: true,
+			FindingID: "F-1", FindingTitle: "Owned finding", Scope: "Review source",
+			Questions: []string{"Is the finding reproducible?"},
 			StagePath: `C:\runs\handoffs\h1`, StagedTarget: `C:\runs\handoffs\h1\target`,
 			RecordSHA256: strings.Repeat("e", 64),
 		},
 	}
+	model.width, model.height = 100, 30
 	model.blueHandoffStage = blueHandoffLaunchConfirm
+	stagedView := ansi.Strip(model.blueRunView())
+	for _, want := range []string{"Owned finding", "Review source", "Is the finding reproducible?", `C:\runs\handoffs\h1\target`} {
+		if !strings.Contains(stagedView, want) {
+			t.Fatalf("launch review omitted %q", want)
+		}
+	}
 	model.input.SetValue("STANDARD 98765432")
 	_, cmd = model.updateBlue(tea.KeyMsg{Type: tea.KeyEnter})
 	if got := commandFromCmd(t, cmd, connection); got.Type != "blue.handoff_launch" {

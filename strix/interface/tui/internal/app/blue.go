@@ -175,9 +175,11 @@ func (m Model) blueRunView() string {
 				render.Dim().Render("Route: ")+render.Col(white).Render(handoffRoute(handoff)),
 				render.Dim().Render("Snapshot: ")+render.Col(white).Render(truncatePath(handoff.Snapshot, inner-10)),
 			)
+			for _, question := range handoff.Questions {
+				rows = append(rows, render.Dim().Render("Question: ")+render.Col(white).Render(ansi.Wrap(question, inner-10, " ")))
+			}
 			rows = append(rows, blueHashRows("Source file SHA-256", handoff.SourceSHA256, inner)...)
 			rows = append(rows, blueHashRows("Finding evidence SHA-256", handoff.FindingSHA256, inner)...)
-			rows = append(rows, blueHashRows("Blue findings artifact SHA-256", handoff.FindingsSHA256, inner)...)
 			rows = append(rows, blueHashRows("Review SHA-256 (scope and route)", handoff.ReviewSHA256, inner)...)
 			rows = append(rows,
 				render.Col(amber).Render("Type "+handoff.Phrase+" to stage a target copy"),
@@ -187,8 +189,13 @@ func (m Model) blueRunView() string {
 			rows = append(rows, render.Dim().Render("Waiting for the reviewed handoff action to finish"))
 		case "staged":
 			rows = append(rows,
+				render.Col(white).Render(truncate(handoff.FindingID+" · "+handoff.FindingTitle, inner)),
+				render.Dim().Render("Scope: ")+render.Col(white).Render(truncate(handoff.Scope, inner-7)),
 				render.Dim().Render("Staged target: ")+render.Col(white).Render(truncatePath(handoff.StagedTarget, inner-15)),
 			)
+			for _, question := range handoff.Questions {
+				rows = append(rows, render.Dim().Render("Question: ")+render.Col(white).Render(ansi.Wrap(question, inner-10, " ")))
+			}
 			rows = append(rows, blueHashRows("Staged record SHA-256", handoff.RecordSHA256, inner)...)
 			if handoff.LaunchReady {
 				rows = append(rows,
