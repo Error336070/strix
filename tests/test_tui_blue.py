@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from strix.interface.blue import run_blue
 from strix.interface.tui.backend.controller import TuiController
 
 
@@ -21,6 +22,23 @@ def _args() -> argparse.Namespace:
         scope_mode="auto",
         diff_base=None,
     )
+
+
+def test_blue_command_opens_tui_without_standard_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[argparse.Namespace] = []
+
+    async def fake_run_tui(args: argparse.Namespace) -> None:
+        captured.append(args)
+
+    monkeypatch.delenv("STRIX_LLM", raising=False)
+    monkeypatch.setattr("strix.interface.blue.terminal_attached", lambda: True)
+    monkeypatch.setattr("strix.interface.blue.run_tui", fake_run_tui)
+    assert run_blue([]) == 0
+    assert len(captured) == 1
+    assert captured[0].needs_setup is True
+    assert captured[0].blue_mode is True
 
 
 @pytest.mark.asyncio

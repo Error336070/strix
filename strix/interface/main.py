@@ -61,7 +61,8 @@ logger = logging.getLogger(__name__)
 
 _ROOT_SUBCOMMAND_HELP = """
 Additional commands:
-  strix blue ...           Audit authorized local software (experimental)
+  strix blue               Open the local Blue workspace
+  strix blue prepare PATH  Preview an authorized local audit
   strix runs ...           List or register local run history
   strix cloud ...          Use the managed Strix platform
   strix auth ...           Manage model-subscription sign-in
@@ -261,11 +262,6 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
         "[#60a5fa]docs.strix.ai[/]  [dim]·[/]  "
         "[#60a5fa]discord.gg/strix-ai[/]"
     )
-    if not args.non_interactive:
-        console.print(
-            "[dim]Run a pentest in Strix Cloud[/]  [#60a5fa]app.strix.ai[/]  [dim]·[/]  "
-            "[dim]Enterprise[/]  [#60a5fa]strix.ai/demo[/]"
-        )
     console.print()
     if not args.non_interactive:
         notify_update(console)

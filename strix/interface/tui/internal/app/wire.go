@@ -45,6 +45,9 @@ func (m *Model) handleEnvelope(envelope protocol.Envelope) tea.Cmd {
 			// splash before it.
 			m.showSplash = false
 			m.input.Placeholder = setupPlaceholder
+			if m.snapshot.BlueMode {
+				m.input.Placeholder = "Path to an owned file or directory"
+			}
 			if m.snapshot.BluePreview != nil {
 				m.input.Placeholder = "Type the RUN phrase or /blue cancel"
 			}

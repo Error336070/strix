@@ -46,6 +46,13 @@ func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
 		m.setupMsg("Use /blue [--case-id ID] [--pe-audit PATH] [--provider local --model MODEL --endpoint URL] PATH", render.Col(amber))
 		return *m, nil
 	}
+	if m.snapshot.BlueMode && value == "/standard" {
+		m.setupMsg("Start Standard in another terminal with a configured STRIX_LLM", render.Col(amber))
+		return *m, nil
+	}
+	if m.snapshot.BlueMode && !strings.HasPrefix(value, "/blue ") {
+		value = "/blue " + value
+	}
 	if strings.HasPrefix(value, "/blue ") {
 		payload, err := parseBlueSetup(value)
 		if err != nil {
@@ -178,7 +185,9 @@ func (m *Model) resizeViewport() {
 		// A clipped placeholder reads as an unfinished sentence, so a narrow
 		// composer gets the short prompt instead.
 		m.input.Placeholder = setupPlaceholder
-		if contentWidth-6 < lipgloss.Width(setupPlaceholder) {
+		if m.snapshot.BlueMode {
+			m.input.Placeholder = "Path to an owned file or directory"
+		} else if contentWidth-6 < lipgloss.Width(setupPlaceholder) {
 			m.input.Placeholder = setupPlaceholderShort
 		}
 		m.syncInputHeight()
@@ -402,7 +411,11 @@ func (m Model) setupHeaderView(fit setupFit) string {
 		rows = append(rows, center.Render(lipgloss.NewStyle().Bold(true).Foreground(brightGreen).Render("STRIX")))
 	}
 	if fit.tagline {
-		rows = append(rows, center.Render(render.Dim().Render("Open-source AI hackers for your apps")))
+		tagline := "Open-source AI hackers for your apps"
+		if m.snapshot.BlueMode {
+			tagline = "Local Blue security workspace"
+		}
+		rows = append(rows, center.Render(render.Dim().Render(tagline)))
 	}
 	return strings.Join(rows, "\n")
 }
@@ -465,6 +478,9 @@ func (m Model) setupComposer(width int) string {
 func (m Model) setupSummaryView(width int) string {
 	if preview := m.snapshot.BluePreview; preview != nil {
 		return truncate(render.Col(lightBlue).Render("Blue")+render.Dim().Render(" · "+preview.Model+" · "+preview.Approval+" approval"), max(1, width))
+	}
+	if m.snapshot.BlueMode {
+		return truncate(render.Col(lightBlue).Render("Blue")+render.Dim().Render(" · inspect a local copy · review before running"), max(1, width))
 	}
 	chips := []string{}
 	if model := strings.TrimSpace(m.snapshot.Model); model != "" {
@@ -533,6 +549,8 @@ func (m Model) setupHintsView(width int) string {
 	left := hint("enter", "launch scan") + label("   ") + hint("ctrl+c", "quit")
 	if m.snapshot.BluePreview != nil {
 		left = hint("enter", "confirm Blue phrase") + label("   ") + hint("/blue cancel", "close preview")
+	} else if m.snapshot.BlueMode {
+		left = hint("enter", "preview Blue scope") + label("   ") + hint("ctrl+c", "quit")
 	} else {
 		left += label("   ") + hint("/blue PATH", "preview local scope")
 	}

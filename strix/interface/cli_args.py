@@ -56,7 +56,7 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Strix Multi-Agent Cybersecurity Penetration Testing Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -104,13 +104,6 @@ Examples:
   strix --target ./my-project --workspace-file ./wordlist.txt
   strix --target https://app.com --workspace-file ./openapi.yaml:specs/openapi.yaml
 
-Strix Cloud:
-  strix cloud login
-  strix cloud scans start --source . --yes --wait
-  strix cloud                      # list every cloud resource
-
-  Run a pentest in Strix Cloud     https://app.strix.ai
-  Try Strix Enterprise             https://strix.ai/demo
         """,
     )
 
@@ -319,7 +312,7 @@ Strix Cloud:
         ),
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.
     args.needs_setup = False

@@ -154,6 +154,28 @@ func TestSetupPromptWithoutTargetLaunchesAndRequestsMount(t *testing.T) {
 	}
 }
 
+func TestBlueSetupPathPreviewsWithoutStartingStandard(t *testing.T) {
+	connection := &recordingConn{}
+	model := New(&Client{conn: connection})
+	model.snapshot = protocol.Snapshot{SetupMode: true, BlueMode: true}
+	updated, cmd := model.submit(`"C:\Owned Project\strategy.dll"`)
+	model = updated.(Model)
+	envelopes := drainCommands(t, cmd, connection)
+	if got := commandTypes(envelopes); !reflect.DeepEqual(got, []string{"setup.blue_prepare"}) {
+		t.Fatalf("Blue path must only prepare a scope: %v", got)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(envelopes[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["target"] != `C:\Owned Project\strategy.dll` {
+		t.Fatalf("wrong Blue target: %#v", payload)
+	}
+	if model.pendingPrompt != "" {
+		t.Fatalf("Blue must not queue a Standard prompt: %q", model.pendingPrompt)
+	}
+}
+
 // The backend asks from the live view, so the prompt follows the snapshot.
 func TestPendingMountOpensAndClosesWithTheSnapshot(t *testing.T) {
 	model := New(nil)

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ from strix.core.paths import runs_base_dir
 from strix.interface.blue_codex import run_codex
 from strix.interface.blue_findings import save_findings
 from strix.interface.blue_local import run_local, validate_loopback_endpoint
+from strix.interface.cli_args import parse_arguments, terminal_attached
+from strix.interface.interactive import run_tui
 
 
 _SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", "bin", "obj"}
@@ -239,7 +242,11 @@ def discard_prepared_blue(manifest_path: Path, scope_sha256: str) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="strix blue", description="Operator-led audits of authorized local software"
+        prog="strix blue",
+        description=(
+            "Operator-led audits of authorized local software. "
+            "Run without a subcommand to open the Blue TUI."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     prepare = sub.add_parser("prepare", help="Hash the target and preview a bounded run")
@@ -449,6 +456,22 @@ def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI 
 
 
 def run_blue(argv: list[str]) -> int:
+    if not argv:
+        if not terminal_attached():
+            print(
+                "Blue's interactive workspace needs a terminal. "
+                "Use 'strix blue prepare PATH' for a command-line audit.",
+                file=sys.stderr,
+            )
+            return 2
+        args = parse_arguments([])
+        args.blue_mode = True
+        try:
+            asyncio.run(run_tui(args))
+        except RuntimeError as exc:
+            print(f"Blue workspace stopped: {exc}", file=sys.stderr)
+            return 2
+        return 0
     args = _parser().parse_args(argv)
     try:
         if args.command == "prepare":

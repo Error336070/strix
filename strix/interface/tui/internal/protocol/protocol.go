@@ -99,6 +99,7 @@ type BlueObservation struct {
 
 type Snapshot struct {
 	SetupMode           bool             `json:"setup_mode"`
+	BlueMode            bool             `json:"blue_mode"`
 	ScanStarted         bool             `json:"scan_started"`
 	ScanState           string           `json:"scan_state"`
 	Targets             []string         `json:"targets"`

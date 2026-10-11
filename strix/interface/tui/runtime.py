@@ -165,6 +165,8 @@ class GoTuiRuntime:
     def _start_preparation(self) -> asyncio.Task[None] | None:
         """Kick off the work that runs behind the freshly painted TUI."""
         if self.controller.setup_mode:
+            if self.controller.blue_mode:
+                return None
             self._setup_preflight = asyncio.create_task(self.check_setup_model())
             return self._setup_preflight
         self.start_scan()

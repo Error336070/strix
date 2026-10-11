@@ -67,6 +67,7 @@ class TuiController:
         self.report_state = report_state
         self.scan_loop: asyncio.AbstractEventLoop | None = None
         self.setup_mode = bool(args.needs_setup)
+        self.blue_mode = bool(getattr(args, "blue_mode", False))
         self.scan_started = not self.setup_mode
         self._start_in_progress = False
         self.blue_preview: dict[str, Any] | None = None
@@ -197,6 +198,7 @@ class TuiController:
             subscription = is_subscription_run(self.report_state)
         state = {
             "setup_mode": self.setup_mode,
+            "blue_mode": self.blue_mode,
             "scan_started": self.scan_started,
             "scan_state": self.scan_state,
             "targets": [
