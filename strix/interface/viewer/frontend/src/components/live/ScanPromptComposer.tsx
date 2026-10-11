@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 const ROOT_TARGET_VALUE = "__root__";
 
 interface ScanPromptComposerProps {
+  runName: string;
   /** All agents in the run; used to resolve the root and running children. */
   agents: TranscriptAgent[];
   /**
@@ -34,6 +35,7 @@ interface ScanPromptComposerProps {
  * requires a concrete agent id, so "Root agent" resolves to the root agent's id.
  */
 export function ScanPromptComposer({
+  runName,
   agents,
   fixedAgentId,
   className,
@@ -124,7 +126,7 @@ export function ScanPromptComposer({
     setSending(true);
     setFeedback(null);
     const name = targetName;
-    const res = await steerAgent(targetId, message);
+    const res = await steerAgent(runName, targetId, message);
     setSending(false);
     if (res.ok) {
       setValue("");
@@ -135,7 +137,7 @@ export function ScanPromptComposer({
     } else {
       setFeedback("Could not send that message. Try again.");
     }
-  }, [sending, value, targetId, targetName]);
+  }, [sending, value, targetId, targetName, runName]);
 
   if (!expanded) {
     return (

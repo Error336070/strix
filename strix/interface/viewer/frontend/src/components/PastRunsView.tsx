@@ -1,15 +1,10 @@
 import { useState } from "react";
-import { History, ChevronRight, Terminal } from "lucide-react";
+import { History, ChevronRight } from "lucide-react";
 import type { RunListEntry, RunsPayload, RunSeverityCounts } from "@/data/serverSource";
 import { runTitle } from "@/lib/target-utils";
-import { trackCta } from "@/lib/cta";
-import EmailVerifyInline from "@/components/EmailVerifyInline";
 
 /**
- * "Past runs" panel. Unverified users see a tease with the run count and a
- * verify affordance (the launched run stays fully visible; the CLI
- * `strix view <name>` still works). Verified users get the full history and can
- * switch the active run, which threads ?run=<name> through the data fetches.
+ * Token-protected local history across registered run roots.
  */
 
 const SEV = [
@@ -73,17 +68,15 @@ interface PastRunsViewProps {
   runs: RunsPayload | null;
   activeRun: string | null;
   onSelectRun: (name: string) => void;
-  onVerified: () => void;
 }
 
 export default function PastRunsView({
   runs,
   activeRun,
   onSelectRun,
-  onVerified,
 }: PastRunsViewProps) {
   const count = runs?.count ?? 0;
-  const [showVerify, setShowVerify] = useState(false);
+  const [mode, setMode] = useState<"all" | "blue" | "standard">("all");
 
   if (!runs || runs.locked) {
     return (
@@ -94,33 +87,11 @@ export default function PastRunsView({
         >
           <History className="h-5 w-5 text-[#888]" aria-hidden="true" />
         </div>
-        <h2 className="text-base font-semibold text-white">Browse every run on this machine</h2>
+        <h2 className="text-base font-semibold text-white">Local viewer session required</h2>
         <p className="mx-auto mt-1.5 max-w-md text-sm text-[#888]">
-          You have {count} past {count === 1 ? "run" : "runs"} on this machine.
+          {count} {count === 1 ? "run is" : "runs are"} available in the registered local roots.
         </p>
-        {showVerify ? (
-          <>
-            <p className="mx-auto mt-3 max-w-sm text-xs text-[#666]">
-              Verify your email with a one-time code to unlock the full history.
-            </p>
-            <EmailVerifyInline onVerified={onVerified} />
-          </>
-        ) : (
-          <button
-            onClick={() => {
-              trackCta("history_unlock", "past_runs");
-              setShowVerify(true);
-            }}
-            className="mt-4 cursor-pointer rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black transition-opacity hover:opacity-90"
-          >
-            View runs
-          </button>
-        )}
-        <p className="mt-4 flex items-center justify-center gap-1.5 text-xs text-[#555]">
-          <Terminal className="h-3.5 w-3.5" aria-hidden="true" />
-          Or open one from the CLI with{" "}
-          <code className="font-mono text-[#888]">strix view &lt;name&gt;</code>
-        </p>
+        <p className="mt-4 text-xs text-[#555]">Open the token-bearing URL printed by strix view.</p>
       </div>
     );
   }
@@ -135,7 +106,12 @@ export default function PastRunsView({
 
   return (
     <div className="space-y-2">
-      {runs.runs.map((run: RunListEntry) => {
+      <div className="flex gap-2 pb-2" aria-label="Filter runs by mode">
+        {(["all", "blue", "standard"] as const).map((item) => (
+          <button key={item} onClick={() => setMode(item)} className={`rounded-lg border px-3 py-1 text-xs capitalize ${mode === item ? "border-white text-white" : "border-[#333] text-[#888]"}`}>{item}</button>
+        ))}
+      </div>
+      {runs.runs.filter((run) => mode === "all" || run.mode === mode).map((run: RunListEntry) => {
         const active = run.name === activeRun;
         const date = formatTimeAgo(run.start_time) ?? formatTimeAgo(run.end_time);
         const title = runTitle(run.target, run.name);
@@ -152,6 +128,7 @@ export default function PastRunsView({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <span className="truncate text-sm font-medium text-white">{title}</span>
+                <span className="rounded border border-[#444] px-1.5 py-0.5 text-[10px] uppercase text-[#aaa]">{run.mode}</span>
                 {active && (
                   <span className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-400" style={{ border: "1px solid rgba(16,185,129,0.3)" }}>
                     Active
@@ -164,6 +141,7 @@ export default function PastRunsView({
                 {date && <span>{date}</span>}
                 {date && run.status && <span className="text-[#333]">·</span>}
                 {run.status && <span className="capitalize">{run.status}</span>}
+                <span className="font-mono">Case {run.case_id}</span>
               </div>
             </div>
             <SeverityChips counts={run.severity_counts} />

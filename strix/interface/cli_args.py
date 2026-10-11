@@ -168,6 +168,12 @@ Strix Cloud:
         "(e.g., '--instruction-file ./detailed_instructions.txt').",
     )
 
+    parser.add_argument("--case-id", help="Link this run to a local research case.")
+    parser.add_argument("--parent-run-id", help="Run that supplied the reviewed handoff.")
+    parser.add_argument(
+        "--finding-ref", action="append", help="Finding selected for this follow-up."
+    )
+
     parser.add_argument(
         "--workspace-file",
         type=str,

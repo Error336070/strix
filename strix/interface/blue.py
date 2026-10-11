@@ -14,7 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from strix.core.paths import runs_base_dir
 from strix.interface.blue_codex import run_codex
+from strix.interface.blue_findings import save_findings
 from strix.interface.blue_local import run_local, validate_loopback_endpoint
 
 
@@ -93,6 +95,8 @@ def build_manifest(
     approval: str,
     provider: str = "codex",
     endpoint: str | None = None,
+    case_id: str | None = None,
+    pe_audit: Path | None = None,
 ) -> dict[str, Any]:
     target = target.resolve(strict=True)
     output = output.parent.resolve(strict=True) / output.name
@@ -107,9 +111,19 @@ def build_manifest(
     elif provider != "codex" or endpoint is not None:
         raise BlueError("Codex provider does not accept a local endpoint.")
     entries = inventory(target)
+    tool_record = None
+    if pe_audit is not None:
+        tool = pe_audit.resolve(strict=True)
+        if not tool.is_file():
+            raise BlueError("PE helper must be a regular file.")
+        tool_record = {"path": str(tool), "sha256": _file_hash(tool)}
     manifest: dict[str, Any] = {
         "schema": "strix-blue-local-v1",
         "created_utc": datetime.now(UTC).isoformat(),
+        "run_id": output.name,
+        "case_id": case_id or output.name,
+        "parent_run_id": None,
+        "pe_audit": tool_record,
         "target": str(target),
         "output": str(output),
         "input_snapshot": str(output / "inputs"),
@@ -132,6 +146,12 @@ def _json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _event(output: Path, kind: str, summary: str) -> None:
+    entry = {"timestamp": datetime.now(UTC).isoformat(), "kind": kind, "summary": summary}
+    with (output / "blue-events.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def _copy_snapshot(manifest: dict[str, Any]) -> None:
     target = Path(manifest["target"])
     root = Path(manifest["input_snapshot"])
@@ -146,13 +166,6 @@ def _copy_snapshot(manifest: dict[str, Any]) -> None:
             or _file_hash(destination) != entry["sha256"]
         ):
             raise BlueError(f"Target changed while copying: {entry['path']}")
-        data = destination.read_bytes()
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise BlueError(f"Blue v1 supports UTF-8 text only: {entry['path']}") from exc
-        if b"\x00" in data:
-            raise BlueError(f"Blue v1 supports UTF-8 text only: {entry['path']}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -163,8 +176,10 @@ def _parser() -> argparse.ArgumentParser:
     prepare = sub.add_parser("prepare", help="Hash the target and preview a bounded run")
     prepare.add_argument("target", type=Path, help="Local file or directory you may assess")
     prepare.add_argument(
-        "--output", type=Path, required=True, help="Fresh directory for the manifest and evidence"
+        "--output", type=Path, help="Fresh directory for the manifest and evidence"
     )
+    prepare.add_argument("--case-id", help="Case identifier shared with linked Standard runs")
+    prepare.add_argument("--pe-audit", type=Path, help="Hash-pin the RE-LAB PE metadata helper")
     prepare.add_argument(
         "--model", default="gpt-6-sol", help="Codex subscription model with Daybreak Blue access"
     )
@@ -178,10 +193,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     run = sub.add_parser("run", help="Recheck target hashes and start a prepared audit")
     run.add_argument("manifest", type=Path, help="Manifest written by prepare")
+    handoff = sub.add_parser("handoff", help="Stage a reviewed Blue finding for Standard")
+    handoff.add_argument("run", nargs="?", help="Blue run name in the shared catalog")
+    handoff.add_argument("--finding", action="append", default=[], help="Recorded finding ID")
+    handoff.add_argument("--question", action="append", default=[], help="Question for Standard")
+    handoff.add_argument("--scope", help="New Standard scope and limits")
+    handoff.add_argument(
+        "--staged", type=Path, help="Launch a previously reviewed handoff directory"
+    )
+    handoff.add_argument("--model", help="Local Standard model route")
+    handoff.add_argument(
+        "--endpoint", help="Loopback OpenAI-compatible /v1 endpoint"
+    )
+    handoff.add_argument("--launch", action="store_true", help="Launch Standard after review")
     return parser
 
 
-def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912
+def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912, PLR0915
     manifest_path = manifest_path.absolute()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != "strix-blue-local-v1":
@@ -229,6 +257,7 @@ def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912
         raise BlueError("Run cancelled.")
     manifest["status"] = "running"
     _json(manifest_path, manifest)
+    _event(output, "run_started", "Blue analysis started")
     try:
         outcome = (run_codex if manifest["provider"] == "codex-subscription" else run_local)(
             manifest, output
@@ -238,7 +267,17 @@ def _run_prepared(manifest_path: Path) -> None:  # noqa: PLR0912
         manifest["status"] = "failed"
         raise
     finally:
+        manifest["ended_utc"] = datetime.now(UTC).isoformat()
         _json(manifest_path, manifest)
+        _event(output, "run_finished", f"Blue analysis {manifest['status']}")
+    if manifest["status"] == "completed":
+        try:
+            count = save_findings(output, manifest)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            (output / "findings-validation-error.txt").write_text(str(exc), encoding="utf-8")
+            count = 0
+        print(f"Structured findings: {count}. Missing entries stay unreported in the case view.")
+        _event(output, "findings_recorded", f"{count} validated findings")
     print(f"Run {manifest['status']}. Evidence: {output}")
 
 
@@ -246,22 +285,35 @@ def run_blue(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "prepare":
+            output = (
+                args.output
+                or runs_base_dir() / f"blue-{datetime.now(UTC):%Y%m%d-%H%M%S}-{os.getpid()}"
+            )
+            if args.output is None:
+                output.parent.mkdir(parents=True, exist_ok=True)
             manifest = build_manifest(
                 args.target,
-                args.output,
+                output,
                 args.model,
                 args.approval,
                 args.provider,
                 args.endpoint,
+                args.case_id,
+                args.pe_audit,
             )
-            args.output.mkdir(parents=True, exist_ok=False)
+            output.mkdir(parents=True, exist_ok=False)
             _copy_snapshot(manifest)
-            path = args.output / "manifest.json"
+            path = output / "manifest.json"
             _json(path, manifest)
+            _event(output, "prepared", f"{len(manifest['files'])} files hash checked")
             print(json.dumps(manifest, indent=2, ensure_ascii=False))
             print(f'\nRun when ready: strix blue run "{path.absolute()}"')
-        else:
+        elif args.command == "run":
             _run_prepared(args.manifest)
+        else:
+            from strix.interface.blue_handoff import run_handoff  # noqa: PLC0415
+
+            run_handoff(args)
     except (BlueError, OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"Blue run stopped: {exc}", file=sys.stderr)
         return 2

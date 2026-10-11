@@ -154,6 +154,10 @@ export interface RunSeverityCounts {
 
 export interface RunListEntry {
   name: string;
+  mode: "blue" | "standard";
+  case_id: string;
+  parent_run_id: string | null;
+  finding_refs: string[];
   target: string | null;
   scan_mode: string | null;
   status: string | null;
@@ -161,6 +165,53 @@ export interface RunListEntry {
   end_time: string | null;
   finished: boolean;
   severity_counts: RunSeverityCounts;
+}
+
+export interface CaseRun {
+  run_id: string;
+  case_id: string;
+  mode: "blue" | "standard";
+  parent_run_id: string | null;
+  finding_refs: string[];
+  status: string;
+  started_at: string;
+  target: string;
+  findings: number;
+}
+
+export interface CaseEvent {
+  id: string;
+  run_id: string;
+  mode: "blue" | "standard";
+  timestamp: string;
+  kind: string;
+  summary: string;
+  finding_id?: string;
+}
+
+export interface CaseFinding {
+  run_id: string;
+  id: string;
+  title: string;
+  severity: string;
+}
+
+export async function fetchCase(runName?: string | null): Promise<{ case_id: string; runs: CaseRun[]; findings: CaseFinding[] }> {
+  const value = await getJson("/api/case" + runQuery(runName));
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid case response");
+  const record = value as Record<string, unknown>;
+  return {
+    case_id: typeof record.case_id === "string" ? record.case_id : "",
+    runs: Array.isArray(record.runs) ? record.runs as CaseRun[] : [],
+    findings: Array.isArray(record.findings) ? record.findings as CaseFinding[] : [],
+  };
+}
+
+export async function fetchCaseTimeline(runName?: string | null): Promise<CaseEvent[]> {
+  const value = await getJson("/api/case/timeline" + runQuery(runName));
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid timeline response");
+  const events = (value as Record<string, unknown>).events;
+  return Array.isArray(events) ? events as CaseEvent[] : [];
 }
 
 export interface RunsPayload {
@@ -213,6 +264,7 @@ export async function fetchRuns(): Promise<RunsPayload> {
 
 export interface Capabilities {
   can_steer: boolean;
+  owner_run: string;
 }
 
 export type SteerResult = { ok: true } | { ok: false; error: string };
@@ -224,8 +276,9 @@ export async function fetchCapabilities(): Promise<Capabilities> {
 }
 
 /** POST /api/agents/steer. Sends a steering instruction to a running agent. */
-export async function steerAgent(agentId: string, message: string): Promise<SteerResult> {
+export async function steerAgent(runName: string, agentId: string, message: string): Promise<SteerResult> {
   const { ok, data } = await postJson("/api/agents/steer", {
+    run: runName,
     agent_id: agentId,
     message,
   });

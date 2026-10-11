@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-from strix.core.paths import run_record_path
+from strix.core.paths import run_record_path, runs_base_dir
 from strix.interface.viewer import auth
 from strix.interface.viewer.transcript import (
     build_run_state,
@@ -36,6 +36,7 @@ from strix.interface.viewer.transcript import (
     read_vulnerabilities,
     severity_counts,
 )
+from strix.report.cases import case_timeline, catalog_roots, list_case_runs, resolve_case_run
 
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
 def run_list_entry(run_dir: Path) -> dict[str, Any]:
     """Compact summary of a single run for the history list."""
     record = read_run_summary(run_dir)
-    return {
+    entry = {
         "name": record.get("run_name") or run_dir.name,
         "target": primary_target(record),
         "scan_mode": record.get("scan_mode"),
@@ -76,19 +77,23 @@ def run_list_entry(run_dir: Path) -> dict[str, Any]:
         "finished": bool(record.get("finished")),
         "severity_counts": severity_counts(read_vulnerabilities(run_dir)),
     }
+    entry["mode"] = record.get("mode") or "standard"
+    entry["case_id"] = record.get("case_id") or entry["name"]
+    entry["parent_run_id"] = record.get("parent_run_id")
+    return entry
 
 
 def build_runs_payload(base_dir: Path, *, verified: bool) -> dict[str, Any]:
-    """The /api/runs payload. Gates the run list behind email verification.
-
-    The count is always advertised so the UI can tease the history, but the
-    entries only appear once the viewer is verified.
-    """
-    run_dirs = _iter_run_dirs(base_dir)
-    count = len(run_dirs)
+    """The /api/runs payload. The caller must hold the local viewer session."""
+    runs = list_case_runs(base_dir)
+    count = len(runs)
     if not verified:
         return {"locked": True, "count": count, "runs": []}
-    return {"locked": False, "count": count, "runs": [run_list_entry(d) for d in run_dirs]}
+    return {
+        "locked": False,
+        "count": count,
+        "runs": [run_list_entry(run.path) for run in runs],
+    }
 
 
 def resolve_run_dir(base_dir: Path, run_param: str | None, default_run_dir: Path) -> Path | None:
@@ -99,12 +104,8 @@ def resolve_run_dir(base_dir: Path, run_param: str | None, default_run_dir: Path
     """
     if not run_param:
         return default_run_dir
-    base = base_dir.resolve()
-    candidate = (base / run_param).resolve()
-    # Only direct children of the runs base that actually hold a run record.
-    if candidate.parent != base or not run_record_path(candidate).is_file():
-        return None
-    return candidate
+    run = resolve_case_run(run_param, base_dir)
+    return run.path if run is not None else None
 
 
 # Prefix of the cookie carrying the per-process session capability. The bound
@@ -125,7 +126,10 @@ class _ViewerState:
         self.assets_dir = assets_dir
         # The strix_runs directory that holds the launched run; used to
         # enumerate and resolve other runs for the history list.
-        self.base_dir = run_dir.parent
+        shared_root = runs_base_dir()
+        self.base_dir = (
+            shared_root if run_dir.parent in catalog_roots(shared_root) else run_dir.parent
+        )
         # Set only when the viewer runs inside a live scan process (the TUI
         # launcher), which can deliver a message to a running agent. Absent for
         # standalone ``strix view`` / finished runs, so steering is unavailable.
@@ -234,21 +238,26 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
 
-        def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:
-            # The cross-run history list (/api/runs) unlocks its entries only for
-            # a caller that holds this process's session capability *and* is
-            # email verified, so merely reaching an exposed --host port never
-            # leaks the run list (the payload still advertises the count as a
-            # teaser).
+        def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:  # noqa: PLR0912
+            # The local session capability grants access to all registered runs.
+            # Reaching the HTTP port alone never grants access to their data.
             if path == "/api/runs":
-                unlocked = self._has_session() and auth.is_verified()
-                payload = build_runs_payload(state.base_dir, verified=unlocked)
+                if not self._has_session():
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                    return
+                payload = build_runs_payload(state.base_dir, verified=True)
                 self._send_json(HTTPStatus.OK, payload)
                 return
             if path == "/api/capabilities":
                 # Steering is only possible when the viewer shares a live scan's
                 # coordinator + event loop (the TUI launcher wires a handler).
-                self._send_json(HTTPStatus.OK, {"can_steer": state.steer_handler is not None})
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "can_steer": state.steer_handler is not None,
+                        "owner_run": state.run_dir.name,
+                    },
+                )
                 return
             if path == "/api/auth/status":
                 self._handle_auth_status()
@@ -268,14 +277,44 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown run"})
                 return
 
-            # Any run other than the one used to launch the viewer is part of the
-            # email-gated history. The session check above applies to both paths;
-            # verification adds a second gate for historical run data.
-            if run_dir.resolve() != state.run_dir.resolve() and not auth.is_verified():
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unverified"})
-                return
-
-            if path == "/api/run":
+            if path == "/api/case":
+                selected = next(
+                    (item for item in list_case_runs(state.base_dir) if item.path == run_dir), None
+                )
+                case_id = selected.case_id if selected else run_dir.name
+                members = [
+                    member.public()
+                    for member in list_case_runs(state.base_dir)
+                    if member.case_id == case_id
+                ]
+                findings = []
+                for member in list_case_runs(state.base_dir):
+                    if member.case_id != case_id:
+                        continue
+                    findings.extend(
+                        {
+                            "run_id": member.run_id,
+                            "id": finding.get("id"),
+                            "title": finding.get("title"),
+                            "severity": finding.get("severity"),
+                        }
+                        for finding in read_vulnerabilities(member.path)
+                        if isinstance(finding, dict)
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"case_id": case_id, "runs": members, "findings": findings},
+                )
+            elif path == "/api/case/timeline":
+                selected = next(
+                    (item for item in list_case_runs(state.base_dir) if item.path == run_dir), None
+                )
+                case_id = selected.case_id if selected else run_dir.name
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"case_id": case_id, "events": case_timeline(case_id, state.base_dir)},
+                )
+            elif path == "/api/run":
                 self._send_json(HTTPStatus.OK, read_run_summary(run_dir))
             elif path == "/api/vulnerabilities":
                 self._send_json(HTTPStatus.OK, read_vulnerabilities(run_dir))
@@ -434,6 +473,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
             body = self._read_body()
             agent_id = body.get("agent_id")
             message = body.get("message")
+            if body.get("run") != state.run_dir.name:
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "wrong_runtime"})
+                return
             if not isinstance(agent_id, str) or not agent_id.strip():
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_agent_id"})
                 return

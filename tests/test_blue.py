@@ -31,12 +31,12 @@ def test_inventory_rejects_symlink(tmp_path: Path) -> None:
         inventory(target)
 
 
-def test_prepare_rejects_binary_snapshot(tmp_path: Path) -> None:
+def test_prepare_preserves_binary_snapshot(tmp_path: Path) -> None:
     target = tmp_path / "binary.dll"
     target.write_bytes(b"MZ\x00\x01")
     manifest = build_manifest(target, tmp_path / "evidence", "gpt-6-sol", "deny")
-    with pytest.raises(BlueError, match="UTF-8 text only"):
-        _copy_snapshot(manifest)
+    _copy_snapshot(manifest)
+    assert (tmp_path / "evidence" / "inputs" / "binary.dll").read_bytes() == target.read_bytes()
 
 
 def test_output_cannot_overlap_target(tmp_path: Path) -> None:

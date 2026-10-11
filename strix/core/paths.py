@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -11,8 +12,7 @@ RUN_RECORD_FILENAME = "run.json"
 
 
 def run_dir_for(run_name: str, *, cwd: Path | None = None) -> Path:
-    base = cwd or Path.cwd()
-    return base / RUNS_DIR_NAME / run_name
+    return runs_base_dir(cwd=cwd) / run_name
 
 
 def runtime_state_dir(run_dir: Path) -> Path:
@@ -24,8 +24,12 @@ def run_record_path(run_dir: Path) -> Path:
 
 
 def runs_base_dir(*, cwd: Path | None = None) -> Path:
-    base = cwd or Path.cwd()
-    return base / RUNS_DIR_NAME
+    if cwd is None and (configured := os.environ.get("STRIX_RUNS_DIR")):
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            raise ValueError("STRIX_RUNS_DIR must be an absolute path")
+        return root.resolve()
+    return (cwd or Path.cwd()) / RUNS_DIR_NAME
 
 
 def latest_run_dir(*, cwd: Path | None = None) -> Path | None:

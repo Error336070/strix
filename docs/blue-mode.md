@@ -1,33 +1,54 @@
-# Blue mode (experimental)
+# Blue mode and the local case workspace
 
-This fork adds a separate command for operator-led reviews of local software. It does not use Strix's normal scan agent, Docker image, proxy, browser, or attack tools. The first version reviews UTF-8 source files through a hash-checked copy. It does not perform dynamic testing or binary devirtualization.
+Blue reviews a bounded copy of authorized local software. Standard uses Strix's existing scan engine. They can run at the same time and write independent artifacts under a shared runs root. The local viewer combines their history by case ID. One run's model never receives another run's transcript automatically.
 
-## Prepare a run
+## Shared run history
 
-From a source checkout with dependencies installed:
-
-```powershell
-.\.venv\Scripts\python.exe -m strix.interface.blue prepare C:\path\to\owned-source.cs --output C:\path\to\fresh-evidence-directory
-```
-
-`prepare` inventories the target, copies included files to `inputs`, hashes them, and prints the manifest. The output directory must be new and outside the target. It skips `.git`, `.venv`, `node_modules`, `__pycache__`, `bin`, and `obj`, and rejects symlinks. The limit is 500 files and 64 MiB. Check the printed file list before running.
-
-For a locally hosted OpenAI-compatible model, add `--provider local --model MODEL --endpoint http://127.0.0.1:PORT/v1`. The local adapter accepts only `127.0.0.1` or `::1`, sends no tool definitions, and accepts at most 512 KiB of UTF-8 source per run.
-
-## Start and monitor
+Set an absolute `STRIX_RUNS_DIR` before starting either mode. If unset, Strix uses `./strix_runs` as before. Register an older run directory or root without moving it:
 
 ```powershell
-.\.venv\Scripts\python.exe -m strix.interface.blue run C:\path\to\fresh-evidence-directory\manifest.json
+strix runs add-root C:\path\to\old\strix_runs
+strix runs list
+strix view RUN_NAME
 ```
 
-The command checks the target and input hashes again, shows the effective provider and approval setting, then asks you to type `RUN` plus the first file's hash prefix. It streams progress. Press Ctrl+C to stop. A stopped or failed manifest cannot be reused; prepare a new run.
+The viewer shows registered Blue and Standard runs, findings, and a live case timeline. Its local session token grants access to history without email verification. Only the process that owns a live Standard run can steer its agents. The case view labels missing runtime evidence as missing.
 
-The default Codex run uses the signed-in Codex subscription, requests Daybreak Blue on `gpt-6-sol`, disables shell, browser, web search, apps, plugins, and configured MCP servers, and supplies one host-owned `read_scope_file` tool. That tool accepts only an exact path from the manifest and checks the file hash before returning a bounded line range. The Codex turn uses a read-only sandbox with tool network access disabled. The command aborts if an unexpected MCP server starts or Codex reports another tool type.
+## Prepare and run Blue
 
-`--approval auto-review` sets Codex's approval policy to `on-request` and reviewer to `auto_review`. The current static profile has no shell or write tool that should request escalation, so this option mainly verifies the integration path. Auto-review is not a path allowlist. Keep the default `deny` mode for ordinary source reviews.
+`strix blue prepare` prints a manifest with file paths, sizes, and SHA-256 hashes. It copies the files into `inputs`. Review that manifest, then run it:
 
-## Evidence and limits
+```powershell
+strix blue prepare C:\path\to\owned-source --case-id CASE_NAME
+strix blue run C:\path\to\strix_runs\BLUE_RUN\manifest.json
+```
 
-Each run directory contains `manifest.json`, the `inputs` copy, and, on completion, `report.md`. Codex runs also save `codex-settings.json`, `codex-events.jsonl`, and `codex-stderr.log`. The event log and source copy may contain sensitive data; keep the directory private. Findings are model analysis, not proof of runtime behavior. Check cited lines and validate material claims separately.
+The command asks you to type `RUN` followed by the first file's hash prefix. You can set `--output` to a fresh directory. The target and output must not overlap. Blue skips `.git`, `.venv`, `node_modules`, `__pycache__`, `bin`, and `obj`; it rejects symlinks. The current limit is 500 files and 64 MiB.
 
-The app-server protocol is experimental. This Blue path is a standalone CLI workflow; it does not yet add Blue controls to Strix's TUI. Pause and resume, static binary inspection, controlled local execution, and live service testing are outside this first version.
+Blue accepts a Windows PE or .NET file as input. To give the Codex model a bounded metadata tool, pin the existing RE-LAB helper during preparation:
+
+```powershell
+strix blue prepare C:\path\to\owned.dll --pe-audit C:\path\to\RE-LAB\sources\pe-audit\bin\Release\net9.0\pe-audit.exe
+```
+
+The tool checks the snapshot and helper hashes before running the helper on the copy. It reports PE sections, .NET type names, and method counts. It does not recover methods or execute the target. Source reads return at most 200 UTF-8 lines per call.
+
+The default Codex route requests Daybreak Blue on `gpt-6-sol` and disables shell, browser, web search, apps, plugins, and configured MCP servers. It requests a read-only sandbox and no tool network access. `--approval auto-review` uses Codex Auto-review, but this static profile has no write or shell tool. A local OpenAI-compatible Blue model can be used with `--provider local --model MODEL --endpoint http://127.0.0.1:PORT/v1`; that adapter receives up to 512 KiB of UTF-8 source and no tools.
+
+On completion, Blue saves `report.md` and validates any structured findings in the report against exact snapshot paths and hashes. Valid findings appear in `vulnerabilities.json`. Missing or invalid structured findings stay out of the count. Codex runs also save `codex-settings.json`, `codex-events.jsonl`, and `codex-stderr.log`.
+
+## Reviewed Standard handoff
+
+Choose one or more recorded Blue finding IDs. State the new scope and a local model route:
+
+```powershell
+strix blue handoff BLUE_RUN --finding F-1 --question "Can this reproduce on the staged copy?" --scope "Only the staged copy; no remote endpoints"
+```
+
+This writes `handoff.json` and a hash-checked target copy under `STRIX_RUNS_DIR\handoffs`. Review the evidence, selected findings, questions, scope, and copy. A model is optional while staging. To launch that exact copy later, run `strix blue handoff --staged HANDOFF_DIR --model openai/local-model --endpoint http://127.0.0.1:11434/v1 --launch` and confirm in the terminal. The target hashes are checked again before launch. Standard then starts through its normal CLI and Docker engine with its normal tools. The handoff passes only the selected findings and questions. It links the new run by case ID, parent run ID, and finding references. Blue's model route and approvals do not carry over.
+
+Standard's local model requires an OpenAI-compatible endpoint on a loopback IP and a model name such as `openai/local-model`. Check that the chosen service can be reached by Strix's Docker runtime before launching. Standard may change the staged copy. The original audited target stays untouched.
+
+## Current limits
+
+The Blue command still uses a terminal confirmation prompt. Blue setup, action approvals, and progress are not yet inside the Go TUI. PE inspection covers metadata only. Controlled launch or attach, runtime observations, method recovery, and devirtualization are not implemented. The case viewer displays missing evidence rather than implying those checks ran. The operator demo should use an owned fixture and a locally available Standard model.

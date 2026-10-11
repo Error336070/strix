@@ -56,6 +56,11 @@ export function parseTarget(target: string): ParsedTarget {
  * the raw name, then a generic label.
  */
 export function runTitle(target: string | null, fallback: string): string {
-  if (target) return parseTarget(target).display.replace(/\/$/, "");
+  if (target) {
+    if (/^(?:[a-zA-Z]:[\\/]|\/)/.test(target)) {
+      return target.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || fallback;
+    }
+    return parseTarget(target).display.replace(/\/$/, "");
+  }
   return fallback || "Untitled pentest";
 }

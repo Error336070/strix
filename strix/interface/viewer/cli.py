@@ -11,13 +11,12 @@ from rich.console import Console
 
 from strix.core.paths import (
     RUNS_DIR_NAME,
-    latest_run_dir,
-    run_dir_for,
     run_record_path,
     runs_base_dir,
 )
 from strix.interface.viewer.server import authorized_url, bundle_is_built, serve
 from strix.interface.viewer.transcript import read_run_summary
+from strix.report.cases import list_case_runs, resolve_case_run
 
 
 if TYPE_CHECKING:
@@ -121,12 +120,13 @@ def _state_label(summary: dict[str, object]) -> str:
 
 def _resolve_run_dir(run: str | None, console: Console) -> Path:
     if run:
-        run_dir = run_dir_for(run)
-        if not run_record_path(run_dir).is_file():
+        match = resolve_case_run(run)
+        if match is None:
             _fail_no_run(console, requested=run)
-        return run_dir
+        return match.path
 
-    latest = latest_run_dir()
+    catalog = list_case_runs()
+    latest = catalog[0].path if catalog else None
     if latest is None:
         _fail_no_run(console, requested=None)
     return latest

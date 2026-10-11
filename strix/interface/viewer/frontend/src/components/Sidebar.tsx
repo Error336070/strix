@@ -42,6 +42,7 @@ interface SidebarProps {
   mcpInUse: Set<string>;
   runCount: number;
   finished: boolean;
+  isBlue: boolean;
   verified: boolean;
   email: string | null;
   onOpenEmail: () => void;
@@ -68,6 +69,7 @@ export default function Sidebar({
   mcpInUse,
   runCount,
   finished,
+  isBlue,
   verified,
   email,
   onOpenEmail,
@@ -231,7 +233,7 @@ export default function Sidebar({
           <div className="relative flex flex-col gap-px px-2">
             <NavItem
               icon={<ProjectsIcon />}
-              label="Pentest Overview"
+              label={isBlue ? "Audit overview" : "Pentest overview"}
               active={view === "overview"}
               onClick={() => onSelectView("overview")}
             />
@@ -261,7 +263,13 @@ export default function Sidebar({
               active={view === "history"}
               onClick={onOpenHistory}
             />
-            {finished && (
+            <NavItem
+              icon={<History className="h-4 w-4" />}
+              label="Case workspace"
+              active={view === "case"}
+              onClick={() => onSelectView("case")}
+            />
+            {finished && !isBlue && (
               <NavItem
                 icon={<Mail className="h-4 w-4" />}
                 label="Export report"

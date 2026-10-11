@@ -557,9 +557,14 @@ def test_steer_requires_session_cookie(tmp_path: Path, monkeypatch: pytest.Monke
 
     httpd, url, token = serve(run_dir, open_browser=False, steer_handler=handler)
     try:
-        body = {"agent_id": "root", "message": "focus on auth"}
+        body = {"run": "steer", "agent_id": "root", "message": "focus on auth"}
         # No cookie: rejected before reaching the live coordinator.
         status, _ = _post(url, "/api/agents/steer", body)
+        assert status == 403
+        assert delivered == []
+
+        wrong = {**body, "run": "other"}
+        status, _ = _post(url, "/api/agents/steer", wrong, cookie=_session_cookie(url, token))
         assert status == 403
         assert delivered == []
 
@@ -619,7 +624,7 @@ def test_report_send_rejects_live_run(tmp_path: Path, monkeypatch: pytest.Monkey
         httpd.server_close()
 
 
-def test_historical_run_data_requires_verification(
+def test_historical_run_data_requires_local_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launched = _make_run(tmp_path, "launched", status="completed", end_time="2026-01-01T00:00:00Z")
@@ -641,9 +646,9 @@ def test_historical_run_data_requires_verification(
         verified["value"] = True
         assert _get_status(f"{url}/api/run?run=other") == 403
 
-        # With the cookie but not verified, the history gate returns 401.
+        # Local history uses the viewer token, independent of email status.
         verified["value"] = False
-        assert _get_status(f"{url}/api/run?run=other", cookie=cookie) == 401
+        assert _get_status(f"{url}/api/run?run=other", cookie=cookie) == 200
 
         # With both the cookie and verification, the historical run resolves.
         verified["value"] = True
@@ -653,14 +658,14 @@ def test_historical_run_data_requires_verification(
         httpd.server_close()
 
 
-def test_runs_list_requires_session_and_verification(
+def test_runs_list_requires_session_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     launched = _make_run(tmp_path, "launched", status="completed", end_time="2026-01-01T00:00:00Z")
     _make_run(tmp_path, "other", status="completed", end_time="2026-01-01T00:00:00Z")
     _bundle(tmp_path, monkeypatch)
 
-    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: True)
+    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: False)
 
     def _runs(cookie: str | None) -> dict[str, object]:
         headers = {"Cookie": cookie} if cookie else {}
@@ -670,17 +675,59 @@ def test_runs_list_requires_session_and_verification(
 
     httpd, url, token = serve(launched, open_browser=False)
     try:
-        # A cookie-less caller (even with the machine verified) only sees the
-        # teaser count, never the run entries.
-        payload = _runs(None)
-        assert payload["locked"] is True
-        assert payload["count"] == 2
-        assert payload["runs"] == []
+        # A caller without the local token cannot enumerate history at all.
+        assert _get_status(f"{url}/api/runs") == 403
 
         # With the session cookie and verification, the entries unlock.
         payload = _runs(_session_cookie(url, token))
         assert payload["locked"] is False
         assert {r["name"] for r in payload["runs"]} == {"launched", "other"}  # type: ignore[attr-defined]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_case_api_links_blue_and_standard_with_local_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    standard = _make_run(tmp_path, "standard", status="running", end_time=None)
+    base = standard.parent
+    monkeypatch.setenv("STRIX_RUNS_DIR", str(base))
+    standard_record = json.loads((standard / "run.json").read_text(encoding="utf-8"))
+    standard_record.update({"case_id": "case-1", "parent_run_id": "blue", "mode": "standard"})
+    (standard / "run.json").write_text(json.dumps(standard_record), encoding="utf-8")
+    blue = base / "blue"
+    blue.mkdir()
+    (blue / "manifest.json").write_text(
+        json.dumps({"schema": "strix-blue-local-v1", "case_id": "case-1", "status": "completed"}),
+        encoding="utf-8",
+    )
+    (blue / "vulnerabilities.json").write_text(
+        '[{"id":"F-1","title":"Recorded issue","severity":"low"}]', encoding="utf-8"
+    )
+    (blue / "blue-events.jsonl").write_text(
+        '{"timestamp":"2026-01-01T00:00:00Z","kind":"prepared","summary":"Snapshot checked"}\n',
+        encoding="utf-8",
+    )
+    _bundle(tmp_path, monkeypatch)
+    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: False)
+    httpd, url, token = serve(blue, open_browser=False)
+    try:
+        assert _get_status(f"{url}/api/case") == 403
+        cookie = _session_cookie(url, token)
+        request = urllib.request.Request(f"{url}/api/case", headers={"Cookie": cookie})  # noqa: S310
+        with urllib.request.urlopen(request) as response:  # noqa: S310
+            payload = json.loads(response.read())
+        assert {run["run_id"] for run in payload["runs"]} == {"blue", "standard"}
+        assert payload["findings"] == [
+            {"run_id": "blue", "id": "F-1", "title": "Recorded issue", "severity": "low"}
+        ]
+        request = urllib.request.Request(  # noqa: S310
+            f"{url}/api/case/timeline", headers={"Cookie": cookie}
+        )
+        with urllib.request.urlopen(request) as response:  # noqa: S310
+            timeline = json.loads(response.read())
+        assert timeline["events"][0]["summary"] == "Snapshot checked"
     finally:
         httpd.shutdown()
         httpd.server_close()

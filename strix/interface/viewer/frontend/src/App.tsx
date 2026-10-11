@@ -26,6 +26,8 @@ import {
   fetchAll,
   fetchAuthStatus,
   fetchCapabilities,
+  fetchCase,
+  fetchCaseTimeline,
   fetchRunSummary,
   fetchRuns,
   fetchTranscript,
@@ -35,18 +37,22 @@ import {
   type AuthStatus,
   type LoadedRun,
   type RunsPayload,
+  type CaseRun,
+  type CaseEvent,
+  type CaseFinding,
 } from "@/data/serverSource";
 import { SIGNUP_URL, DEMO_URL, ctaUrl, trackCta } from "@/lib/cta";
 import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
 import PastRunsView from "@/components/PastRunsView";
+import CaseWorkspaceView from "@/components/CaseWorkspaceView";
 import EmailReportView from "@/components/EmailReportView";
 import { RunDetails } from "@/components/RunDetails";
 import { TrustToast } from "@/components/TrustToast";
 import FeedbackView from "@/components/FeedbackView";
 import { ProInlineCta } from "@/components/ProCta";
 
-export type View = "overview" | "issues" | "agents" | "history" | "email" | "feedback";
+export type View = "overview" | "issues" | "agents" | "history" | "case" | "email" | "feedback";
 
 const TRUST_BANNER =
   "Your findings stay on your machine. They're rendered here locally in your browser and never uploaded or stored by Strix.";
@@ -62,11 +68,15 @@ export default function App() {
   const [view, setView] = useState<View>("overview");
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [runs, setRuns] = useState<RunsPayload | null>(null);
+  const [caseRuns, setCaseRuns] = useState<CaseRun[]>([]);
+  const [caseFindings, setCaseFindings] = useState<CaseFinding[]>([]);
+  const [caseId, setCaseId] = useState("");
+  const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   const [emailPurpose, setEmailPurpose] = useState<"report" | "verify">("report");
   const [emailSkipDisclosure, setEmailSkipDisclosure] = useState(false);
   // Whether this viewer can steer a live scan (true only inside the in-TUI
   // launcher that shares the running scan's coordinator + event loop).
-  const [canSteer, setCanSteer] = useState(false);
+  const [steeringOwner, setSteeringOwner] = useState<string | null>(null);
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -85,11 +95,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [detail, events] = await Promise.all([fetchCase(activeRun), fetchCaseTimeline(activeRun)]);
+        if (!cancelled) {
+          setCaseId(detail.case_id);
+          setCaseRuns(detail.runs);
+          setCaseFindings(detail.findings);
+          setCaseEvents(events);
+        }
+      } catch {
+        if (!cancelled) { setCaseRuns([]); setCaseFindings([]); setCaseEvents([]); }
+      }
+    };
+    void refresh();
+    const timer = setInterval(() => { void refresh(); void refreshRuns(); }, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [activeRun, refreshRuns]);
+
+  useEffect(() => {
     void refreshAuth();
     void refreshRuns();
     // Capabilities never change over a session, so fetch once on mount.
     fetchCapabilities()
-      .then((caps) => setCanSteer(caps.can_steer))
+      .then((caps) => setSteeringOwner(caps.can_steer ? caps.owner_run : null))
       .catch(() => {
         /* absence of steering is the safe default */
       });
@@ -170,6 +200,7 @@ export default function App() {
   const selected = run?.vulnerabilities.find((v) => v.id === selectedId) ?? null;
   const agentCount = run?.transcript.agents.length ?? 0;
   const verified = auth?.verified === true;
+  const isBlue = run?.raw.mode === "blue";
 
   // The run's persisted MCP roster (from run.json via /api/run), plus the set of
   // connections with a tool call currently in flight. "In use" is derived here
@@ -249,11 +280,6 @@ export default function App() {
     userSetView("history");
   }, [refreshRuns, userSetView]);
 
-  const onPastRunsVerified = useCallback(async () => {
-    await refreshAuth();
-    await refreshRuns();
-  }, [refreshAuth, refreshRuns]);
-
   const onForget = useCallback(async () => {
     await forgetAuth();
     await refreshAuth();
@@ -278,6 +304,7 @@ export default function App() {
         mcpInUse={mcpInUse}
         runCount={runs?.count ?? 0}
         finished={run?.finished ?? false}
+        isBlue={isBlue}
         verified={verified}
         email={auth?.email ?? null}
         onOpenEmail={openEmail}
@@ -302,7 +329,7 @@ export default function App() {
             </a>
             {run && <LiveIndicator finished={run.finished} />}
             <div className="ml-auto flex items-center gap-3">
-              {verified && runs && !runs.locked && runs.runs.length > 0 && (
+              {runs && !runs.locked && runs.runs.length > 0 && (
                 <RunSwitcher
                   runs={runs}
                   activeRun={activeRun}
@@ -310,7 +337,7 @@ export default function App() {
                   onSelect={selectRun}
                 />
               )}
-              <a
+              {!isBlue && <a
                 href={ctaUrl(SIGNUP_URL, "run_in_cloud")}
                 target="_blank"
                 rel="noopener noreferrer"
@@ -319,7 +346,7 @@ export default function App() {
               >
                 Run in the cloud
                 <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
-              </a>
+              </a>}
             </div>
           </div>
         </div>
@@ -338,6 +365,10 @@ export default function App() {
             key={`${activeRun ?? "launched"}:${view}:${selectedId ?? ""}`}
             className="animate-page-in space-y-6"
           >
+          <div className="flex flex-wrap gap-4 border-b border-[#2a2a2a] pb-3 lg:hidden">
+            <button className={`text-sm ${view === "case" ? "text-white" : "text-[#888]"}`} onClick={() => userSetView("case")}>Case workspace</button>
+            <button className={`text-sm ${view === "history" ? "text-white" : "text-[#888]"}`} onClick={openHistory}>Run history</button>
+          </div>
           {view === "email" ? (
             <EmailReportView
               activeRun={activeRun}
@@ -355,6 +386,19 @@ export default function App() {
               defaultEmail={auth?.email ?? null}
               onExit={(dest) => setView(dest)}
             />
+          ) : view === "case" ? (
+            <CaseWorkspaceView
+              caseId={caseId}
+              runs={caseRuns}
+              findings={caseFindings}
+              events={caseEvents}
+              onSelectRun={selectRun}
+              onOpenFinding={(runId, findingId) => {
+                selectRun(runId);
+                setSelectedId(findingId);
+                userSetView("issues");
+              }}
+            />
           ) : view === "history" ? (
             <div className="space-y-4">
               <div className="flex items-center gap-2">
@@ -365,7 +409,6 @@ export default function App() {
                 runs={runs}
                 activeRun={activeRun}
                 onSelectRun={selectRun}
-                onVerified={() => void onPastRunsVerified()}
               />
             </div>
           ) : !run && !error ? (
@@ -380,7 +423,7 @@ export default function App() {
               {/* Tab strip: shown on small screens where the sidebar is hidden. */}
               <div className="flex gap-5 border-b border-[#2a2a2a] lg:hidden">
                 <TabButton active={view === "overview"} onClick={() => userSetView("overview")}>
-                  Pentest Overview
+                  {isBlue ? "Audit overview" : "Pentest overview"}
                 </TabButton>
                 <TabButton active={view === "issues"} onClick={() => userSetView("issues")}>
                   Issues{run.vulnerabilities.length > 0 ? ` (${run.vulnerabilities.length})` : ""}
@@ -401,9 +444,13 @@ export default function App() {
                   raw={run.raw}
                   finished={run.finished}
                   onOpenEmail={openEmailFromOverview}
+                  isBlue={isBlue}
                 />
               ) : view === "agents" && agentCount > 0 ? (
-                <AgentsTab run={run} canSteer={canSteer} />
+                <AgentsTab
+                  run={run}
+                  canSteer={steeringOwner !== null && (activeRun ?? steeringOwner) === steeringOwner}
+                />
               ) : selected ? (
                 <div className="space-y-4">
                   <button
@@ -412,7 +459,13 @@ export default function App() {
                   >
                     <ArrowLeft className="w-4 h-4" /> Back to all findings
                   </button>
-                  <VulnerabilityDetail vulnerability={selected} />
+                  <VulnerabilityDetail vulnerability={selected} showWorkflowCtas={!isBlue} />
+                  <div className="rounded-lg border border-[#333] p-4 text-sm">
+                    <h2 className="font-semibold">Case evidence links</h2>
+                    <p className="mt-2 text-[#aaa]">Source or binary location: {selected.code_locations?.map((location) => `${location.file}:${location.start_line}`).join(", ") || selected.target || "Missing exact location"}</p>
+                    <p className="mt-2 text-[#aaa]">Runtime observation: {caseEvents.filter((item) => item.finding_id === selected.id).length ? `${caseEvents.filter((item) => item.finding_id === selected.id).length} recorded events` : "Missing linked observation"}</p>
+                    <p className="mt-2 text-[#aaa]">Standard follow-ups: {caseRuns.filter((item) => item.parent_run_id === (activeRun || run.summary.runName) && item.finding_refs.includes(selected.id)).length || "None recorded"}</p>
+                  </div>
                 </div>
               ) : (
                 <FindingsList
@@ -454,7 +507,7 @@ function RunSwitcher({
         className="flex items-center gap-2 rounded-lg border border-[#3a3a3a] bg-[rgba(255,255,255,0.05)] px-3 py-2 text-sm text-white transition-colors hover:border-[#555] hover:bg-[rgba(255,255,255,0.09)]"
       >
         <History className="h-4 w-4 flex-shrink-0 text-[#888]" aria-hidden="true" />
-        <span className="flex-shrink-0 text-[#888]">Pentest</span>
+        <span className="flex-shrink-0 text-[#888]">Run</span>
         <span className="max-w-[260px] truncate font-medium">{current}</span>
         <ChevronDown className="h-4 w-4 flex-shrink-0 text-[#aaa]" aria-hidden="true" />
       </button>
@@ -667,6 +720,7 @@ function OverviewTab({
   raw,
   finished,
   onOpenEmail,
+  isBlue,
 }: {
   summary: ParsedRunSummary;
   counts: Record<VulnerabilitySeverity, number>;
@@ -675,6 +729,7 @@ function OverviewTab({
   raw: Record<string, unknown>;
   finished: boolean;
   onOpenEmail: () => void;
+  isBlue: boolean;
 }) {
   const sections = (
     [
@@ -701,13 +756,9 @@ function OverviewTab({
 
       {/* Primary CTA: the one primary on Overview. Hidden until the run is
           finished, since a live scan would only email a partial report. */}
-      {finished && (
-        <div className="animate-card-in">
-          <EmailReportCta onOpenEmail={onOpenEmail} />
-        </div>
-      )}
+      {finished && !isBlue && <div className="animate-card-in"><EmailReportCta onOpenEmail={onOpenEmail} /></div>}
 
-      {finished && (
+      {finished && !isBlue && (
         <div className="animate-card-in rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
           <p className="text-sm font-semibold text-white">Strix Cloud</p>
           <p className="mt-0.5 text-xs text-[#666]">Run your next pentest in Strix Cloud.</p>
@@ -776,6 +827,7 @@ function TabButton({
 
 function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
   const { agents, events } = run.transcript;
+  const runName = run.summary.runName ?? run.summary.runId ?? "";
   const graphAgents = useMemo(() => buildGraphAgents(agents, events), [agents, events]);
   // Clicking a graph node opens the agent's transcript in a modal; no node selected means no modal.
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -810,7 +862,7 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
       </div>
 
       {/* Live steering: only in-process while the scan runs. Otherwise omitted. */}
-      {steerable && <ScanPromptComposer agents={agents} />}
+      {steerable && <ScanPromptComposer runName={runName} agents={agents} />}
 
       {/* Re-run always routes to Strix Cloud. */}
       <div className="rounded-xl border border-[#222] bg-[rgba(255,255,255,0.02)] p-5">
@@ -841,6 +893,7 @@ function AgentsTab({ run, canSteer }: { run: LoadedRun; canSteer: boolean }) {
         agent={selectedAgent}
         events={events}
         steerable={steerable}
+        runName={runName}
         onClose={() => setSelectedId(null)}
       />
     </div>
