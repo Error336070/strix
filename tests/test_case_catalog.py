@@ -10,7 +10,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from strix.core.paths import run_dir_for, runs_base_dir
-from strix.report.cases import add_catalog_root, case_timeline, list_case_runs, resolve_case_run
+from strix.report.cases import (
+    add_catalog_root,
+    case_finding_locations,
+    case_timeline,
+    list_case_handoffs,
+    list_case_runs,
+    resolve_case_run,
+)
 
 
 def _write(path: Path, name: str, value: dict[str, object]) -> Path:
@@ -79,3 +86,59 @@ def test_legacy_blue_and_live_case_events(tmp_path: Path) -> None:
         for event in events
     )
     assert all(event["run_id"] in {"blue-old", "red-new"} for event in events)
+
+
+def test_case_handoffs_expose_reviewed_metadata_only(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    stage = root / "handoffs" / "handoff-1"
+    stage.mkdir(parents=True)
+    (stage / "handoff.json").write_text(
+        json.dumps(
+            {
+                "schema": "strix-reviewed-handoff-v1",
+                "case_id": "case-1",
+                "parent_run_id": "blue-1",
+                "finding_refs": ["F-1"],
+                "scope": "Only the staged copy",
+                "questions": ["Is this reachable?"],
+                "files": [{"path": "sample.cs", "sha256": "a" * 64, "size": 5}],
+                "launch_ready": False,
+                "created_utc": "2026-10-11T00:00:00+00:00",
+                "target": "C:/private/staged/target",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert list_case_handoffs("other-case", root) == []
+    assert list_case_handoffs("case-1", root) == [
+        {
+            "id": "handoff-1",
+            "parent_run_id": "blue-1",
+            "finding_refs": ["F-1"],
+            "scope": "Only the staged copy",
+            "questions": ["Is this reachable?"],
+            "files": [{"path": "sample.cs", "sha256": "a" * 64}],
+            "launch_ready": False,
+            "created_at": "2026-10-11T00:00:00+00:00",
+        }
+    ]
+
+
+def test_case_finding_location_uses_its_blue_manifest_hash(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "blue-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "strix-blue-local-v1",
+                "case_id": "case-1",
+                "files": [{"path": "sample.cs", "sha256": "b" * 64}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run = list_case_runs(tmp_path / "runs")[0]
+    assert case_finding_locations(
+        run,
+        {"code_locations": [{"file": "sample.cs", "start_line": 5}]},
+    ) == [{"path": "sample.cs", "line": 5, "sha256": "b" * 64}]

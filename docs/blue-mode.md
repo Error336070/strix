@@ -2,7 +2,7 @@
 
 Blue reviews a bounded copy of authorized local software. Standard uses Strix's existing scan engine. They can run at the same time and write independent artifacts under a shared runs root. The local viewer combines their history by case ID. One run's model never receives another run's transcript automatically.
 
-In the interactive Strix TUI, type `/blue PATH` on the setup screen to prepare a local Blue scope. The preview shows the target, included files, permitted operations, full scope SHA-256, first file SHA-256, and manifest location. Review `manifest.json` for the complete file list when the preview shows more files than fit on screen. Type `RUN` followed by the first eight characters of the scope SHA-256 to start Blue. `/blue cancel` removes the prepared snapshot only if its manifest and files are unchanged; otherwise it leaves the evidence in place. The ordinary `strix blue prepare` and `strix blue run` commands remain available with their existing confirmation phrase.
+In the interactive Strix TUI, type `/blue PATH` on the setup screen to prepare a local Blue scope. Optional flags are `--case-id ID`, `--pe-audit PATH`, `--provider local --model MODEL --endpoint http://127.0.0.1:PORT/v1`, and `--approval auto-review` for the Codex route. Quote paths containing spaces. The preview shows the route, target, included files, permitted operations, full scope SHA-256, first file SHA-256, and manifest location. Review `manifest.json` for the complete file list when the preview shows more files than fit on screen. Type `RUN` followed by the first eight characters of the scope SHA-256 to start Blue. `/blue cancel` removes the prepared snapshot only if its manifest and files are unchanged; otherwise it leaves the evidence in place. The ordinary `strix blue prepare` and `strix blue run` commands remain available with their existing confirmation phrase.
 
 ## Shared run history
 
@@ -14,7 +14,7 @@ strix runs list
 strix view RUN_NAME
 ```
 
-The viewer shows registered Blue and Standard runs, findings, and a live case timeline. Its local session token grants access to history without email verification. Only the process that owns a live Standard run can steer its agents. The case view labels missing runtime evidence as missing.
+The viewer shows registered Blue and Standard runs, findings, reviewed handoffs, and a live case timeline. Finding cards include recorded source or binary locations and hashes. Handoff cards show selected finding IDs, scope, questions, recorded target hashes, and matching Standard follow-ups. Its local session token grants access to history without email verification. Only the process that owns a live Standard run can steer its agents. The case view labels missing runtime evidence as missing.
 
 ## Prepare and run Blue
 
@@ -37,7 +37,7 @@ The tool checks the snapshot and helper hashes before running the helper on the 
 
 ## Approved runtime observation
 
-After a Blue run completes, press `o` in its TUI view and enter `/observe launch "relative.exe" [seconds]` or `/observe attach "relative.exe" PID [seconds]`. The TUI displays the included snapshot executable, its SHA-256, the time limit, the local evidence path, and a warning that the program may contact services or change the host. Type the displayed `LAUNCH` or `ATTACH` phrase to approve that one action. The viewer's case timeline links the saved observation to the Blue run.
+After a Blue run completes, press `o` in its TUI view and enter `/observe launch "relative.exe" [seconds]` or `/observe attach "relative.exe" PID [seconds]`. The TUI displays the included snapshot executable, its SHA-256, the time limit, the local evidence path, and a warning that the program may contact services or change the host. Type the displayed `LAUNCH` or `ATTACH` phrase to approve that one action. For repeated launches of the same snapshot executable, the first preview also offers a `GRANT` phrase. That starts the first observation and permits at most three operator-entered launch actions, 30 total requested observation seconds, and 10 minutes. Each later action still needs its own `/observe` command, preview, and Enter. Attach always needs its own `ATTACH` phrase. The viewer's case timeline links saved observations to the Blue run.
 
 The CLI can observe a completed run too:
 
@@ -45,7 +45,7 @@ The CLI can observe a completed run too:
 strix blue observe C:\path\to\BLUE_RUN\manifest.json --mode launch --file relative.exe --timeout 2
 ```
 
-The CLI checks the original target path against the run manifest before launch; the TUI uses the snapshot. A .NET executable may require its adjacent DLL, `.runtimeconfig.json`, and `.deps.json` files, so prepare the containing directory when using the TUI. Both flows require an explicit confirmation phrase. They save local JSONL process events and enforce a bounded observation time. Attached processes are observed without sending signals. The observer records the path hash at validation time; it cannot prove the exact bytes loaded by Windows. It does not isolate the target or contain child processes.
+Both the CLI and TUI check and use the completed run's snapshot. A .NET executable may require its adjacent DLL, `.runtimeconfig.json`, and `.deps.json` files, so prepare the containing directory. Both flows require an explicit confirmation phrase. They save local JSONL process events and enforce a bounded observation time. Attached processes are observed without sending signals, and their image path must match the snapshot executable. The observer records the path hash at validation time; it cannot prove the exact bytes loaded by Windows. It does not isolate the target or contain child processes.
 
 The default Codex route requests Daybreak Blue on `gpt-6-sol` and disables shell, browser, web search, apps, plugins, and configured MCP servers. It requests a read-only sandbox and no tool network access. `--approval auto-review` uses Codex Auto-review, but this static profile has no write or shell tool. A local OpenAI-compatible Blue model can be used with `--provider local --model MODEL --endpoint http://127.0.0.1:PORT/v1`; that adapter receives up to 512 KiB of UTF-8 source and no tools.
 
@@ -65,4 +65,4 @@ Standard's local model requires an OpenAI-compatible endpoint on a loopback IP a
 
 ## Current limits
 
-The Go TUI shows Blue scope preview, confirmation, run status, and per-action runtime approval. Process observation records start, exit, and timeout events; it does not provide method tracing or devirtualization. PE inspection covers metadata only. There is no bounded approve-all option yet. The case viewer displays missing evidence rather than implying those checks ran. A full Blue-to-Standard operator demo still needs an available local OpenAI-compatible Standard model.
+The Go TUI shows Blue scope preview, confirmation, run status, and scoped runtime approvals. Process observation records start, exit, and timeout events; it does not provide method tracing or devirtualization. PE inspection covers metadata only. Grants last only for the current TUI process and cannot be renewed within that run; after expiry or exhaustion, actions return to per-action phrases. The case viewer displays missing evidence rather than implying those checks ran. A full Blue-to-Standard operator demo still needs an available local OpenAI-compatible Standard model.

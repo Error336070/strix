@@ -379,26 +379,23 @@ def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI 
     output = Path(manifest["output"]).resolve(strict=True)
     if manifest.get("schema") != "strix-blue-local-v1" or manifest_path != output / "manifest.json":
         raise BlueError("Expected a Blue manifest in its declared output directory.")
-    target = Path(manifest["target"]).resolve(strict=True)
-    if inventory(target) != manifest["files"]:
-        raise BlueError("Target changed since preparation. Prepare a new Blue run.")
+    if manifest.get("status") != "completed":
+        raise BlueError("Runtime observation requires a completed Blue run.")
+    snapshot = output / "inputs"
+    if Path(manifest["input_snapshot"]).resolve(strict=True) != snapshot:
+        raise BlueError("Blue snapshot path changed.")
+    files = manifest.get("files")
+    if not isinstance(files, list) or inventory(snapshot) != files:
+        raise BlueError("Blue snapshot changed since preparation.")
     relative = args.file
-    if target.is_file():
-        if relative is not None:
-            raise BlueError("--file is only valid for a directory target.")
-        selected = target
-        entry = manifest["files"][0]
-        scope = target.parent
-    else:
-        if relative is None or relative.is_absolute() or ".." in relative.parts:
-            raise BlueError("A directory target requires a relative --file within its manifest.")
-        entry = next(
-            (item for item in manifest["files"] if Path(item["path"]) == relative), None
-        )
-        if entry is None:
-            raise BlueError("Selected file is not in the Blue manifest.")
-        selected = target / relative
-        scope = target
+    if relative is None and len(files) == 1:
+        relative = Path(files[0]["path"])
+    if relative is None or relative.is_absolute() or ".." in relative.parts:
+        raise BlueError("Select a relative --file within the Blue snapshot.")
+    entry = next((item for item in files if Path(item["path"]) == relative), None)
+    if entry is None:
+        raise BlueError("Selected file is not in the Blue manifest.")
+    selected = snapshot / relative
     if args.mode == "launch" and args.pid is not None:
         raise BlueError("--pid is only valid with --mode attach.")
     if args.mode == "attach" and (args.pid is None or args.pid <= 0):
@@ -406,7 +403,7 @@ def _observe_prepared(args: argparse.Namespace) -> None:  # noqa: PLR0912 - CLI 
 
     evidence = output / f"runtime-{datetime.now(UTC):%Y%m%d-%H%M%S}-{secrets.token_hex(4)}.jsonl"
     permit = TargetPermit(
-        scope_root=scope,
+        scope_root=snapshot,
         target=selected,
         sha256=entry["sha256"],
         allow_launch=args.mode == "launch",

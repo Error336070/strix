@@ -131,6 +131,9 @@ func (m Model) updateBlue(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.blueActionStage == blueActionConfirm && observation != nil && observation.Status == "pending" {
 			phrase := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
+			if phrase == "" && observation.GrantEligible {
+				return m, send(m.client, "blue.observe_confirm", map[string]any{"use_grant": true})
+			}
 			return m, send(m.client, "blue.observe_confirm", map[string]any{"phrase": phrase})
 		}
 	}

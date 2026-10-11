@@ -160,6 +160,96 @@ def resolve_case_run(run_id: str, primary: Path | None = None) -> CaseRun | None
     return matches[0] if len(matches) == 1 else None
 
 
+def list_case_handoffs(case_id: str, primary: Path | None = None) -> list[dict[str, Any]]:
+    """List recorded handoff metadata for a case without opening staged targets."""
+    handoffs: list[dict[str, Any]] = []
+    for root in catalog_roots(primary):
+        directory = root / "handoffs"
+        try:
+            stages = directory.iterdir()
+            for stage in stages:
+                if not stage.is_dir() or stage.is_symlink():
+                    continue
+                record = _read_json(stage / "handoff.json")
+                if (
+                    record.get("schema") != "strix-reviewed-handoff-v1"
+                    or record.get("case_id") != case_id
+                    or not isinstance(record.get("parent_run_id"), str)
+                ):
+                    continue
+                refs = record.get("finding_refs")
+                files = record.get("files")
+                questions = record.get("questions")
+                if not isinstance(refs, list) or not isinstance(files, list):
+                    continue
+                handoffs.append(
+                    {
+                        "id": stage.name,
+                        "parent_run_id": record["parent_run_id"],
+                        "finding_refs": [ref for ref in refs if isinstance(ref, str)],
+                        "scope": record.get("scope")
+                        if isinstance(record.get("scope"), str)
+                        else "",
+                        "questions": [item for item in questions if isinstance(item, str)]
+                        if isinstance(questions, list)
+                        else [],
+                        "files": [
+                            {"path": item["path"], "sha256": item["sha256"]}
+                            for item in files
+                            if isinstance(item, dict)
+                            and isinstance(item.get("path"), str)
+                            and isinstance(item.get("sha256"), str)
+                        ],
+                        "launch_ready": record.get("launch_ready") is True,
+                        "created_at": record.get("created_utc")
+                        if isinstance(record.get("created_utc"), str)
+                        else "",
+                    }
+                )
+        except OSError:
+            continue
+    return sorted(handoffs, key=lambda item: (item["created_at"], item["id"]), reverse=True)
+
+
+def case_finding_locations(run: CaseRun, finding: dict[str, Any]) -> list[dict[str, Any]]:
+    """Join recorded finding locations to hashes in the same run's Blue manifest."""
+    manifest = _read_json(run.path / "manifest.json") if run.mode == "blue" else {}
+    files = manifest.get("files")
+    hashes = (
+        {
+            item["path"]: item["sha256"]
+            for item in files
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("sha256"), str)
+        }
+        if isinstance(files, list)
+        else {}
+    )
+    locations = finding.get("code_locations")
+    result: list[dict[str, Any]] = []
+    if isinstance(locations, list):
+        for location in locations:
+            if not isinstance(location, dict) or not isinstance(location.get("file"), str):
+                continue
+            path = location["file"]
+            line = location.get("start_line")
+            result.append(
+                {
+                    "path": path,
+                    "line": line
+                    if isinstance(line, int) and not isinstance(line, bool) and line > 0
+                    else None,
+                    "sha256": hashes.get(path),
+                }
+            )
+    if not result:
+        path = finding.get("code_file") or finding.get("target")
+        if isinstance(path, str) and path:
+            result.append({"path": path, "line": None, "sha256": hashes.get(path)})
+    return result
+
+
 def event_time(value: Any, fallback: str = "") -> str:
     if isinstance(value, int | float) and value > 0:
         return datetime.fromtimestamp(value / 1000, UTC).isoformat()

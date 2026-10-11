@@ -20,7 +20,11 @@ def _prepared_exe(tmp_path: Path) -> Path:
     target.write_bytes(data)
     output = tmp_path / "runs" / "blue-owned"
     blue.prepare_blue(target, output)
-    return output / "manifest.json"
+    manifest_path = output / "manifest.json"
+    record = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record["status"] = "completed"
+    manifest_path.write_text(json.dumps(record), encoding="utf-8")
+    return manifest_path
 
 
 def test_observe_launch_requires_typed_approval(
@@ -32,7 +36,8 @@ def test_observe_launch_requires_typed_approval(
         blue_runtime, "launch_confirmation_phrase", lambda *_args: "LAUNCH REVIEWED"
     )
 
-    def fake_observe(_permit: object, **kwargs: object) -> SimpleNamespace:
+    def fake_observe(permit: blue_runtime.TargetPermit, **kwargs: object) -> SimpleNamespace:
+        assert permit.target == manifest.parent / "inputs" / "owned.exe"
         calls.append(kwargs)
         Path(kwargs["evidence_path"]).write_text('{"event":"process_exited"}\n', encoding="utf-8")
         return SimpleNamespace(pid=4321, status="exited")
@@ -54,13 +59,26 @@ def test_observe_launch_requires_typed_approval(
     assert "PID 4321" in events[-1]["summary"]
 
 
-def test_observe_rejects_changed_target_before_approval(
+def test_observe_rejects_changed_snapshot_before_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest = _prepared_exe(tmp_path)
-    (tmp_path / "owned.exe").write_bytes(b"changed")
+    (manifest.parent / "inputs" / "owned.exe").write_bytes(b"changed")
     monkeypatch.setattr(
         "builtins.input", lambda _prompt: pytest.fail("Invalid target must not prompt for approval")
+    )
+    assert blue.run_blue(["observe", str(manifest), "--mode", "launch"]) == 2
+
+
+def test_observe_requires_completed_run_before_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _prepared_exe(tmp_path)
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    record["status"] = "prepared"
+    manifest.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("Prepared run must not prompt")
     )
     assert blue.run_blue(["observe", str(manifest), "--mode", "launch"]) == 2
 

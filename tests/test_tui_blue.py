@@ -64,6 +64,31 @@ async def test_blue_preview_requires_matching_hash_phrase(
 
 
 @pytest.mark.asyncio
+async def test_blue_preview_shows_selected_local_route_and_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "owned.dll"
+    target.write_bytes(b"MZ" + b"\0" * 126)
+    helper = tmp_path / "pe-audit.exe"
+    helper.write_bytes(b"owned helper")
+    monkeypatch.setenv("STRIX_RUNS_DIR", str(tmp_path / "runs"))
+    controller = TuiController(_args())
+    preview = await controller.handle(
+        "setup.blue_prepare",
+        {
+            "target": str(target), "case_id": "owned-case", "provider": "local",
+            "model": "local-audit", "endpoint": "http://127.0.0.1:11434/v1",
+            "approval": "deny", "pe_audit": str(helper),
+        },
+    )
+    assert preview["case_id"] == "owned-case"
+    assert preview["provider"] == "local-openai-compatible"
+    assert preview["model"] == "local-audit"
+    assert preview["endpoint"] == "http://127.0.0.1:11434/v1"
+    assert preview["pe_audit"]["path"] == str(helper)
+
+
+@pytest.mark.asyncio
 async def test_blue_preview_cancel_does_not_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

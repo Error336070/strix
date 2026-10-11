@@ -1,11 +1,13 @@
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from strix.interface.blue import BlueError, _copy_snapshot, build_manifest
 from strix.interface.blue_findings import extract_findings, save_findings
-from strix.interface.blue_handoff import load_staged_handoff, stage_handoff
+from strix.interface.blue_handoff import load_staged_handoff, run_handoff, stage_handoff
 from strix.report.cases import case_timeline, list_case_runs
 
 
@@ -39,6 +41,13 @@ def test_source_finding_handoff_is_hashed_and_linked(
     assert (stage / "target" / "owned.cs").read_bytes() == target.read_bytes()
     assert len(record["findings"]) == 1
     assert load_staged_handoff(stage)["finding_refs"] == ["F-1"]
+    record_path = stage / "handoff.json"
+    changed_record = json.loads(record_path.read_text(encoding="utf-8"))
+    changed_record["findings"][0]["title"] = "Changed after review"
+    record_path.write_text(json.dumps(changed_record), encoding="utf-8")
+    with pytest.raises(BlueError, match="differs from the linked Blue evidence"):
+        load_staged_handoff(stage)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
     (stage / "target" / "owned.cs").write_text("tampered\n", encoding="utf-8")
     with pytest.raises(BlueError, match="hashes"):
         load_staged_handoff(stage)
@@ -57,3 +66,40 @@ def test_finding_location_must_match_saved_source(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="outside"):
         extract_findings(report, manifest)
+
+
+def test_handoff_launch_rechecks_staged_copy_after_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("STRIX_RUNS_DIR", str(tmp_path / "runs"))
+    source = tmp_path / "owned.cs"
+    source.write_text("class Owned {}\n", encoding="utf-8")
+    blue_run = tmp_path / "runs" / "blue-source"
+    blue_run.parent.mkdir(parents=True)
+    manifest = build_manifest(source, blue_run, "gpt-6-sol", "deny", case_id="case-1")
+    blue_run.mkdir()
+    _copy_snapshot(manifest)
+    manifest["status"] = "completed"
+    (blue_run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (blue_run / "vulnerabilities.json").write_text(
+        json.dumps([{"id": "F-1", "title": "Owned fixture", "path": "owned.cs"}]),
+        encoding="utf-8",
+    )
+    stage, _ = stage_handoff("blue-source", ["F-1"], [], "Staged copy only", None, None)
+
+    def tamper_at_prompt(_prompt: str) -> str:
+        (stage / "target" / "owned.cs").write_text("changed\n", encoding="utf-8")
+        digest = hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest()
+        return "STANDARD " + digest[:8]
+
+    monkeypatch.setattr("builtins.input", tamper_at_prompt)
+    monkeypatch.setattr(
+        "strix.interface.blue_handoff.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("Changed target must not reach Standard"),
+    )
+    args = SimpleNamespace(
+        staged=stage, launch=True, run=None, finding=[], scope=None, question=[],
+        model="openai/local-test", endpoint="http://127.0.0.1:11434/v1",
+    )
+    with pytest.raises(BlueError, match="hashes"):
+        run_handoff(args)

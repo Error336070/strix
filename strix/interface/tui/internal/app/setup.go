@@ -43,16 +43,16 @@ func (m *Model) submitSetupPrompt(value string) (tea.Model, tea.Cmd) {
 		return *m, send(m.client, "setup.blue_confirm", map[string]any{"phrase": value})
 	}
 	if value == "/blue" {
-		m.setupMsg("Use /blue PATH to prepare a local file or directory", render.Col(amber))
+		m.setupMsg("Use /blue [--case-id ID] [--pe-audit PATH] [--provider local --model MODEL --endpoint URL] PATH", render.Col(amber))
 		return *m, nil
 	}
 	if strings.HasPrefix(value, "/blue ") {
-		target := strings.Trim(strings.TrimSpace(strings.TrimPrefix(value, "/blue ")), "\"")
-		if target == "" {
-			m.setupMsg("Use /blue PATH to prepare a local file or directory", render.Col(amber))
+		payload, err := parseBlueSetup(value)
+		if err != nil {
+			m.setupMsg(err.Error(), render.Col(amber))
 			return *m, nil
 		}
-		return *m, send(m.client, "setup.blue_prepare", map[string]any{"target": target})
+		return *m, send(m.client, "setup.blue_prepare", payload)
 	}
 	var commands []tea.Cmd
 	fields := strings.Fields(value)

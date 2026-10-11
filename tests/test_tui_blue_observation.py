@@ -192,3 +192,132 @@ async def test_manifest_cannot_redirect_runtime_snapshot(
         await controller.handle(
             "blue.observe_preview", {"mode": "launch", "path": "owned.exe"}
         )
+
+
+@pytest.mark.asyncio
+async def test_scoped_grant_requires_preview_and_counts_each_mock_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = await _completed_blue(tmp_path, monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def fake_observe(
+        permit: blue_runtime.TargetPermit, **kwargs: object
+    ) -> blue_runtime.ObservationResult:
+        calls.append(kwargs)
+        evidence = kwargs["evidence_path"]
+        assert isinstance(evidence, Path)
+        evidence.write_text('{"event":"mock"}\n', encoding="utf-8")
+        return blue_runtime.ObservationResult(
+            mode="launch", pid=4321, path_sha256_at_validation=permit.sha256,
+            loaded_image_sha256=None, status="exited", exit_code=0,
+            evidence_path=evidence, elapsed_seconds=0.1,
+        )
+
+    monkeypatch.setattr(blue_runtime, "observe_runtime", fake_observe)
+    first = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe", "timeout_seconds": 10}
+    )
+    assert first["grant_phrase"].startswith("GRANT ")
+    assert first["grant_eligible"] is False
+    with pytest.raises(ValueError, match="not eligible"):
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+    assert not calls
+    await controller.handle("blue.observe_confirm", {"phrase": first["grant_phrase"]})
+    assert controller._blue_observation_task is not None
+    await asyncio.wait_for(controller._blue_observation_task, timeout=5)
+    over_budget = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe", "timeout_seconds": 21}
+    )
+    assert over_budget["grant_eligible"] is False
+    with pytest.raises(ValueError, match="not eligible"):
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+    await controller.handle("blue.observe_cancel", {})
+    for used in (1, 2):
+        preview = await controller.handle(
+            "blue.observe_preview", {"mode": "launch", "path": "owned.exe", "timeout_seconds": 10}
+        )
+        assert preview["grant_eligible"] is True
+        assert preview["grant_used"] == used
+        assert preview["grant_phrase"] == ""
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+        assert controller._blue_observation_task is not None
+        await asyncio.wait_for(controller._blue_observation_task, timeout=5)
+    assert len(calls) == 3
+    assert all(call["confirmation_phrase"].startswith("LAUNCH ") for call in calls)
+    fourth = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe", "timeout_seconds": 1}
+    )
+    assert fourth["grant_eligible"] is False
+    with pytest.raises(ValueError, match="not eligible"):
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+    events = [
+        json.loads(line) for line in (Path(first["evidence"]).parent / "blue-events.jsonl")
+        .read_text(encoding="utf-8").splitlines()
+    ]
+    grants = [entry for entry in events if entry["kind"] == "runtimeGrantUsed"]
+    assert len(grants) == 3
+    assert [f"used {n}/3" in entry["summary"] for n, entry in enumerate(grants, 1)] == [True] * 3
+    assert sum(entry["kind"] == "runtimeGrantCreated" for entry in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_grant_never_covers_attach_or_changed_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = await _completed_blue(tmp_path, monkeypatch)
+    first = await controller.handle(
+        "blue.observe_preview", {"mode": "attach", "path": "owned.exe", "pid": 99}
+    )
+    assert first["grant_phrase"] == ""
+    assert first["grant_eligible"] is False
+    with pytest.raises(ValueError, match="not eligible"):
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+    await controller.handle("blue.observe_cancel", {})
+    launch = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe"}
+    )
+    assert launch["grant_phrase"]
+    Path(launch["path"]).write_bytes(_pe() + b"changed")
+    with pytest.raises(ValueError, match="snapshot changed"):
+        await controller.handle("blue.observe_confirm", {"phrase": launch["grant_phrase"]})
+    assert controller._blue_grant is None
+
+
+@pytest.mark.asyncio
+async def test_expired_grant_cannot_dispatch_another_mock_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = await _completed_blue(tmp_path, monkeypatch)
+    calls = 0
+
+    def fake_observe(
+        permit: blue_runtime.TargetPermit, **kwargs: object
+    ) -> blue_runtime.ObservationResult:
+        nonlocal calls
+        calls += 1
+        evidence = kwargs["evidence_path"]
+        assert isinstance(evidence, Path)
+        evidence.write_text('{"event":"mock"}\n', encoding="utf-8")
+        return blue_runtime.ObservationResult(
+            mode="launch", pid=1, path_sha256_at_validation=permit.sha256,
+            loaded_image_sha256=None, status="exited", exit_code=0,
+            evidence_path=evidence, elapsed_seconds=0.1,
+        )
+
+    monkeypatch.setattr(blue_runtime, "observe_runtime", fake_observe)
+    preview = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe"}
+    )
+    await controller.handle("blue.observe_confirm", {"phrase": preview["grant_phrase"]})
+    assert controller._blue_observation_task is not None
+    await asyncio.wait_for(controller._blue_observation_task, timeout=5)
+    assert controller._blue_grant is not None
+    controller._blue_grant["expires_monotonic"] = 0.0
+    expired = await controller.handle(
+        "blue.observe_preview", {"mode": "launch", "path": "owned.exe"}
+    )
+    assert expired["grant_eligible"] is False
+    with pytest.raises(ValueError, match="not eligible"):
+        await controller.handle("blue.observe_confirm", {"use_grant": True})
+    assert calls == 1

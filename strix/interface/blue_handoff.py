@@ -86,6 +86,21 @@ def stage_handoff(
     return stage, record
 
 
+def _verify_recorded_findings(source_path: Path, record: dict[str, object]) -> None:
+    findings = record.get("findings")
+    if not isinstance(findings, list) or not findings:
+        raise BlueError("The handoff has no selected findings.")
+    recorded = json.loads((source_path / "vulnerabilities.json").read_text(encoding="utf-8"))
+    if not isinstance(recorded, list):
+        raise BlueError("The linked Blue findings are unavailable.")
+    for finding in findings:
+        if not isinstance(finding, dict) or sum(item == finding for item in recorded) != 1:
+            raise BlueError("A staged finding differs from the linked Blue evidence.")
+    refs = [item.get("id") for item in findings]
+    if not all(isinstance(ref, str) and ref for ref in refs) or record.get("finding_refs") != refs:
+        raise BlueError("Staged finding references changed.")
+
+
 def load_staged_handoff(stage: Path) -> dict[str, object]:
     """Recheck a saved handoff before a separate, later launch."""
     if stage.is_symlink():
@@ -111,8 +126,7 @@ def load_staged_handoff(stage: Path) -> dict[str, object]:
     source_manifest = json.loads((source.path / "manifest.json").read_text(encoding="utf-8"))
     if source_manifest.get("files") != record["files"]:
         raise BlueError("The linked Blue evidence hashes differ from the handoff.")
-    if not isinstance(record.get("findings"), list) or not record["findings"]:
-        raise BlueError("The handoff has no selected findings.")
+    _verify_recorded_findings(source.path, record)
     if not isinstance(record.get("scope"), str) or not record["scope"].strip():
         raise BlueError("The handoff has no scoped instruction.")
     return record
@@ -144,9 +158,13 @@ def run_handoff(args: object) -> None:
         raise BlueError("Standard's local model must use openai/MODEL.")
     validate_loopback_endpoint(endpoint)
     print(f"Standard model: {args.model}; endpoint: {endpoint}")
-    phrase = f"STANDARD {hashlib.sha256((stage / 'handoff.json').read_bytes()).hexdigest()[:8]}"
+    reviewed_hash = hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest()
+    phrase = f"STANDARD {reviewed_hash[:8]}"
     if input(f"Type {phrase} to launch: ").strip() != phrase:
         raise BlueError("Standard launch cancelled; staged copy retained.")
+    if hashlib.sha256((stage / "handoff.json").read_bytes()).hexdigest() != reviewed_hash:
+        raise BlueError("Handoff changed during approval; staged copy retained.")
+    record = load_staged_handoff(stage)
     instruction = (
         "Investigate only the staged target and within this scope: " + str(record["scope"]) + "\n"
         "Questions: " + "; ".join(str(item) for item in record["questions"]) + "\n"

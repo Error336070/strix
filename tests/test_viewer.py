@@ -720,8 +720,16 @@ def test_case_api_links_blue_and_standard_with_local_token(
             payload = json.loads(response.read())
         assert {run["run_id"] for run in payload["runs"]} == {"blue", "standard"}
         assert payload["findings"] == [
-            {"run_id": "blue", "id": "F-1", "title": "Recorded issue", "severity": "low"}
+            {
+                "run_id": "blue",
+                "id": "F-1",
+                "title": "Recorded issue",
+                "severity": "low",
+                "locations": [],
+                "evidence": "",
+            }
         ]
+        assert payload["handoffs"] == []
         request = urllib.request.Request(  # noqa: S310
             f"{url}/api/case/timeline", headers={"Cookie": cookie}
         )

@@ -29,6 +29,35 @@ func TestBlueSetupRoutesPrepareWithoutStandardLaunch(t *testing.T) {
 	}
 }
 
+func TestBlueSetupCarriesReviewedRouteAndCase(t *testing.T) {
+	model, connection := newCommandTestModel(t)
+	model.snapshot = protocol.Snapshot{SetupMode: true}
+	_, cmd := model.submit(`/blue --case-id owned-case --provider local --model local-audit --endpoint http://127.0.0.1:11434/v1 --pe-audit "C:\RE LAB\pe-audit.exe" "C:\Owned Fixture\sample.dll"`)
+	envelope := commandFromCmd(t, cmd, connection)
+	if envelope.Type != "setup.blue_prepare" {
+		t.Fatalf("command = %s", envelope.Type)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"case_id": "owned-case", "provider": "local", "model": "local-audit",
+		"endpoint": "http://127.0.0.1:11434/v1", "pe_audit": `C:\RE LAB\pe-audit.exe`,
+		"target": `C:\Owned Fixture\sample.dll`,
+	} {
+		if payload[key] != want {
+			t.Errorf("%s = %q, want %q", key, payload[key], want)
+		}
+	}
+}
+
+func TestBlueSetupRejectsUnknownOption(t *testing.T) {
+	if _, err := parseBlueSetup(`/blue --unsafe C:\owned.exe`); err == nil {
+		t.Fatal("unknown Blue option was accepted")
+	}
+}
+
 func TestBlueRunKeepsOwningTUIOpen(t *testing.T) {
 	model := New(nil)
 	model.snapshot = protocol.Snapshot{

@@ -72,22 +72,29 @@ type BluePreview struct {
 	Model          string         `json:"model"`
 	Provider       string         `json:"provider"`
 	Approval       string         `json:"approval"`
+	Endpoint       *string        `json:"endpoint"`
+	PeAudit        map[string]any `json:"pe_audit"`
 }
 
 type BlueObservation struct {
-	Status         string  `json:"status"`
-	Mode           string  `json:"mode"`
-	Path           string  `json:"path"`
-	SHA256         string  `json:"sha256"`
-	TimeoutSeconds float64 `json:"timeout_seconds"`
-	PID            *int    `json:"pid"`
-	Evidence       string  `json:"evidence"`
-	Warning        string  `json:"warning"`
-	Phrase         string  `json:"phrase"`
-	Error          string  `json:"error"`
-	ResultStatus   string  `json:"result_status"`
-	ElapsedSeconds float64 `json:"elapsed_seconds"`
-	ExitCode       *int    `json:"exit_code"`
+	Status           string  `json:"status"`
+	Mode             string  `json:"mode"`
+	Path             string  `json:"path"`
+	SHA256           string  `json:"sha256"`
+	TimeoutSeconds   float64 `json:"timeout_seconds"`
+	PID              *int    `json:"pid"`
+	Evidence         string  `json:"evidence"`
+	Warning          string  `json:"warning"`
+	Phrase           string  `json:"phrase"`
+	GrantPhrase      string  `json:"grant_phrase"`
+	GrantEligible    bool    `json:"grant_eligible"`
+	GrantUsed        int     `json:"grant_used"`
+	GrantSecondsUsed float64 `json:"grant_seconds_used"`
+	GrantExpiresUTC  string  `json:"grant_expires_utc"`
+	Error            string  `json:"error"`
+	ResultStatus     string  `json:"result_status"`
+	ElapsedSeconds   float64 `json:"elapsed_seconds"`
+	ExitCode         *int    `json:"exit_code"`
 }
 
 type Snapshot struct {

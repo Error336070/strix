@@ -194,16 +194,88 @@ export interface CaseFinding {
   id: string;
   title: string;
   severity: string;
+  locations: { path: string; line: number | null; sha256: string | null }[];
+  evidence: string;
 }
 
-export async function fetchCase(runName?: string | null): Promise<{ case_id: string; runs: CaseRun[]; findings: CaseFinding[] }> {
+export interface CaseHandoff {
+  id: string;
+  parent_run_id: string;
+  finding_refs: string[];
+  scope: string;
+  questions: string[];
+  files: { path: string; sha256: string }[];
+  launch_ready: boolean;
+  created_at: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseCaseHandoffs(value: unknown): CaseHandoff[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.id !== "string" || typeof entry.parent_run_id !== "string") return [];
+    const files = Array.isArray(entry.files) ? entry.files.flatMap((file) =>
+      isRecord(file) && typeof file.path === "string" && typeof file.sha256 === "string"
+        ? [{ path: file.path, sha256: file.sha256 }]
+        : []
+    ) : [];
+    return [{
+      id: entry.id,
+      parent_run_id: entry.parent_run_id,
+      finding_refs: Array.isArray(entry.finding_refs) ? entry.finding_refs.filter((ref): ref is string => typeof ref === "string") : [],
+      scope: typeof entry.scope === "string" ? entry.scope : "",
+      questions: Array.isArray(entry.questions) ? entry.questions.filter((question): question is string => typeof question === "string") : [],
+      files,
+      launch_ready: entry.launch_ready === true,
+      created_at: typeof entry.created_at === "string" ? entry.created_at : "",
+    }];
+  });
+}
+
+function parseCaseRuns(value: unknown): CaseRun[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.run_id !== "string") return [];
+    return [{
+      ...entry,
+      finding_refs: Array.isArray(entry.finding_refs) ? entry.finding_refs.filter((ref): ref is string => typeof ref === "string") : [],
+    } as CaseRun];
+  });
+}
+
+function parseCaseFindings(value: unknown): CaseFinding[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.run_id !== "string" || typeof entry.id !== "string") return [];
+    const locations = Array.isArray(entry.locations) ? entry.locations.flatMap((location) =>
+      isRecord(location) && typeof location.path === "string"
+        ? [{ path: location.path, line: typeof location.line === "number" ? location.line : null,
+          sha256: typeof location.sha256 === "string" ? location.sha256 : null }]
+        : []
+    ) : [];
+    return [{
+      run_id: entry.run_id,
+      id: entry.id,
+      title: typeof entry.title === "string" ? entry.title : "Untitled finding",
+      severity: typeof entry.severity === "string" ? entry.severity : "unknown",
+      locations,
+      evidence: typeof entry.evidence === "string" ? entry.evidence : "",
+    }];
+  });
+}
+
+export async function fetchCase(runName?: string | null): Promise<{ case_id: string; runs: CaseRun[]; findings: CaseFinding[]; handoffs: CaseHandoff[] }> {
   const value = await getJson("/api/case" + runQuery(runName));
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid case response");
   const record = value as Record<string, unknown>;
   return {
     case_id: typeof record.case_id === "string" ? record.case_id : "",
-    runs: Array.isArray(record.runs) ? record.runs as CaseRun[] : [],
-    findings: Array.isArray(record.findings) ? record.findings as CaseFinding[] : [],
+    runs: parseCaseRuns(record.runs),
+    findings: parseCaseFindings(record.findings),
+    handoffs: parseCaseHandoffs(record.handoffs),
   };
 }
 

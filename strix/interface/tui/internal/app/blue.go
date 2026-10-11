@@ -44,8 +44,15 @@ func (m Model) bluePreviewView(width int) string {
 		render.Col(amber).Render("Type RUN " + preview.ScopeSHA256[:min(8, len(preview.ScopeSHA256))] + " to start"),
 		render.Dim().Render("Target: ") + render.Col(white).Render(truncatePath(preview.Target, inner-8)),
 		render.Dim().Render(fmt.Sprintf("%d files · %d bytes · case %s", preview.FileCount, preview.TotalBytes, preview.CaseID)),
+		render.Dim().Render("Route: ") + render.Col(white).Render(truncatePath(preview.Provider+" / "+preview.Model+" · approval "+preview.Approval, inner-7)),
 		render.Dim().Render("Operations: ") + render.Col(white).Render(strings.Join(preview.Operations, ", ")),
 		render.Dim().Render("Sandbox: read only · no tool network"),
+	}
+	if preview.Endpoint != nil {
+		rows = append(rows, render.Dim().Render("Local endpoint: ")+render.Col(white).Render(truncatePath(*preview.Endpoint, inner-16)))
+	}
+	if toolPath, ok := preview.PeAudit["path"].(string); ok {
+		rows = append(rows, render.Dim().Render("PE helper: ")+render.Col(white).Render(truncatePath(toolPath, inner-11)))
 	}
 	rows = append(rows, blueHashRows("Scope SHA-256 (all manifest entries)", preview.ScopeSHA256, inner)...)
 	rows = append(rows, render.Dim().Render("Included files:"))
@@ -93,6 +100,9 @@ func (m Model) blueRunView() string {
 			render.Dim().Render("Target: ")+render.Col(white).Render(ansi.Wrap(observation.Path, inner, "")),
 		)
 		rows = append(rows, blueHashRows("Target path SHA-256", observation.SHA256, inner)...)
+		if observation.GrantPhrase != "" || observation.GrantEligible {
+			rows = append(rows, blueHashRows("Grant scope SHA-256 (manifest snapshot)", preview.ScopeSHA256, inner)...)
+		}
 		rows = append(rows,
 			render.Dim().Render("Evidence: ")+blueEvidenceLink(observation.Evidence),
 			render.Col(white).Render(ansi.Wrap(observation.Evidence, inner, "")),
@@ -104,6 +114,20 @@ func (m Model) blueRunView() string {
 				render.Col(amber).Render("Type "+observation.Phrase+" to approve this one action"),
 				render.Dim().Render("Esc cancels without starting the process"),
 			)
+			if observation.GrantPhrase != "" {
+				rows = append(rows,
+					render.Col(amber).Render("Or type "+observation.GrantPhrase+" to start this action and grant"),
+					render.Col(white).Render("up to 3 launch actions for this exact run and executable"),
+					render.Dim().Render("30 total observation seconds · expires "+observation.GrantExpiresUTC),
+					render.Dim().Render("Every later /observe action requires its own preview and Enter"),
+				)
+			} else if observation.GrantEligible {
+				rows = append(rows,
+					render.Col(amber).Render("Press Enter to run this preview under the scoped grant"),
+					render.Dim().Render(fmt.Sprintf("Grant used %d/3 actions · %.1f/30 seconds", observation.GrantUsed, observation.GrantSecondsUsed)),
+					render.Dim().Render("Expires "+observation.GrantExpiresUTC),
+				)
+			}
 		case "running":
 			rows = append(rows, render.Dim().Render("Observation is active. Evidence is written to the path above."))
 		case "completed":

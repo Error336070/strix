@@ -8,9 +8,10 @@ import hashlib
 import json
 import math
 import os
+import time
 import webbrowser
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -71,6 +72,7 @@ class TuiController:
         self.blue_preview: dict[str, Any] | None = None
         self._blue_task: asyncio.Task[None] | None = None
         self.blue_observation: dict[str, Any] | None = None
+        self._blue_grant: dict[str, Any] | None = None
         self._blue_observation_permit: Any = None
         self._blue_observation_task: asyncio.Task[None] | None = None
         self.scan_state = "setup" if self.setup_mode else "running"
@@ -417,6 +419,19 @@ class TuiController:
         if self.targets:
             raise RuntimeError("Clear Standard targets before preparing Blue")
         target = Path(self._required_string(payload, "target"))
+        model = self._required_string({"model": payload.get("model", "gpt-6-sol")}, "model")
+        provider = self._required_string({"provider": payload.get("provider", "codex")}, "provider")
+        approval = self._required_string({"approval": payload.get("approval", "deny")}, "approval")
+        case_id = (
+            self._required_string(payload, "case_id") if "case_id" in payload else None
+        )
+        endpoint = (
+            self._required_string(payload, "endpoint") if "endpoint" in payload else None
+        )
+        pe_audit = (
+            Path(self._required_string(payload, "pe_audit"))
+            if "pe_audit" in payload else None
+        )
         from strix.core.paths import runs_base_dir
         from strix.interface.blue import BlueError, prepare_blue
 
@@ -426,7 +441,10 @@ class TuiController:
         self._start_in_progress = True
         try:
             try:
-                manifest = await asyncio.to_thread(prepare_blue, target, output)
+                manifest = await asyncio.to_thread(
+                    prepare_blue, target, output, model, approval, provider,
+                    endpoint, case_id, pe_audit,
+                )
             except BlueError as exc:
                 raise ValueError(str(exc)) from exc
         finally:
@@ -451,6 +469,8 @@ class TuiController:
             "model": manifest["model"],
             "provider": manifest["provider"],
             "approval": manifest["approval"],
+            "endpoint": manifest["endpoint"],
+            "pe_audit": manifest["pe_audit"],
         }
         self._append_message(
             "Blue snapshot prepared. Review the scope and type its RUN phrase.", "info"
@@ -578,6 +598,30 @@ class TuiController:
         if mode == "attach":
             bound = json.dumps([base_phrase, pid, "attach"], separators=(",", ":"))
             phrase = "ATTACH " + hashlib.sha256(bound.encode("utf-8")).hexdigest()[:20].upper()
+        grant = self._blue_grant
+        grant_eligible = bool(
+            grant is not None
+            and mode == "launch"
+            and grant["manifest"] == str(Path(self.blue_preview["manifest"]).resolve())
+            and grant["scope_sha256"] == self.blue_preview["scope_sha256"]
+            and grant["path"] == str(permit.target)
+            and grant["sha256"] == permit.sha256
+            and grant["used"] < 3
+            and grant["seconds_used"] + seconds <= 30.0
+            and time.monotonic() < grant["expires_monotonic"]
+        )
+        grant_phrase = ""
+        grant_expiry = ""
+        if mode == "launch" and grant is None:
+            grant_expiry = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+            binding = json.dumps(
+                [str(Path(self.blue_preview["manifest"]).resolve()),
+                 self.blue_preview["scope_sha256"], str(permit.target), permit.sha256,
+                 "launch", 3, 30, grant_expiry, uuid4().hex],
+                separators=(",", ":"),
+            )
+            grant_digest = hashlib.sha256(binding.encode("utf-8")).hexdigest()[:20].upper()
+            grant_phrase = "GRANT " + grant_digest
         self._blue_observation_permit = permit
         self.blue_observation = {
             "status": "pending",
@@ -589,6 +633,11 @@ class TuiController:
             "evidence": str(evidence),
             "warning": blue_runtime.WARNING,
             "phrase": phrase,
+            "grant_phrase": grant_phrase,
+            "grant_eligible": grant_eligible,
+            "grant_used": grant["used"] if grant is not None else 0,
+            "grant_seconds_used": grant["seconds_used"] if grant is not None else 0.0,
+            "grant_expires_utc": grant["expires_utc"] if grant is not None else grant_expiry,
         }
         return dict(self.blue_observation)
 
@@ -599,10 +648,14 @@ class TuiController:
         permit = self._blue_observation_permit
         if request is None or request["status"] != "pending" or permit is None:
             raise RuntimeError("No runtime observation is pending")
-        phrase = self._required_string(payload, "phrase")
-        if phrase != request["phrase"]:
+        use_grant = payload.get("use_grant") is True
+        phrase = "" if use_grant else self._required_string(payload, "phrase")
+        create_grant = bool(request["grant_phrase"] and phrase == request["grant_phrase"])
+        if use_grant and not request["grant_eligible"]:
+            raise ValueError("This preview is not eligible for the runtime grant")
+        if not use_grant and not create_grant and phrase != request["phrase"]:
             raise ValueError("Runtime confirmation phrase does not match this request")
-        self._completed_blue_manifest()
+        manifest = self._completed_blue_manifest()
         try:
             base_phrase = await asyncio.to_thread(
                 blue_runtime.launch_confirmation_phrase,
@@ -616,14 +669,79 @@ class TuiController:
         if request["mode"] == "attach":
             bound = json.dumps([base_phrase, request["pid"], "attach"], separators=(",", ":"))
             expected = "ATTACH " + hashlib.sha256(bound.encode("utf-8")).hexdigest()[:20].upper()
-        if phrase != expected:
+        if not use_grant and not create_grant and phrase != expected:
             raise ValueError("Runtime target or evidence changed since preview")
+        if use_grant or create_grant:
+            self._consume_blue_grant(request, manifest, create_grant=create_grant)
+            phrase = base_phrase
         request["status"] = "running"
         request.pop("phrase", None)
+        request.pop("grant_phrase", None)
         self._blue_observation_task = asyncio.create_task(
             self._run_blue_observation(permit, dict(request), phrase)
         )
         return {"started": True, "evidence": request["evidence"]}
+
+    def _consume_blue_grant(
+        self, request: dict[str, Any], manifest: dict[str, Any], *, create_grant: bool
+    ) -> None:
+        from strix.interface.blue import _event
+
+        if request["mode"] != "launch" or request["pid"] is not None:
+            raise ValueError("Reusable grants are limited to launch actions")
+        assert self.blue_preview is not None
+        grant = self._blue_grant
+        if create_grant:
+            if grant is not None:
+                raise ValueError("This Blue run already has a runtime grant")
+            expires_utc = datetime.fromisoformat(request["grant_expires_utc"])
+            remaining = (expires_utc - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                raise ValueError("Runtime grant preview expired; request a new preview")
+            grant = {
+                "id": request["grant_phrase"].split(" ", 1)[1],
+                "manifest": str(Path(self.blue_preview["manifest"]).resolve()),
+                "scope_sha256": self.blue_preview["scope_sha256"],
+                "path": request["path"],
+                "sha256": request["sha256"],
+                "mode": "launch",
+                "used": 0,
+                "seconds_used": 0.0,
+                "expires_utc": request["grant_expires_utc"],
+                "expires_monotonic": time.monotonic() + min(remaining, 600.0),
+            }
+        if (
+            grant is None
+            or grant["manifest"] != str(Path(self.blue_preview["manifest"]).resolve())
+            or grant["scope_sha256"] != self.blue_preview["scope_sha256"]
+            or grant["path"] != request["path"]
+            or grant["sha256"] != request["sha256"]
+            or grant["mode"] != request["mode"]
+            or grant["used"] >= 3
+            or grant["seconds_used"] + request["timeout_seconds"] > 30.0
+            or time.monotonic() >= grant["expires_monotonic"]
+        ):
+            raise ValueError("Runtime grant expired, exhausted, or does not match this request")
+        output = Path(manifest["output"])
+        if create_grant:
+            summary = (
+                f"grant {grant['id']}: scope {grant['scope_sha256']}; "
+                f"target {grant['path']} SHA-256 {grant['sha256']}; launch; "
+                f"max 3 actions, 30 seconds; expires {grant['expires_utc']}"
+            )
+            _event(output, "runtimeGrantCreated", summary)
+            self._blue_grant = grant
+        next_used = grant["used"] + 1
+        next_seconds = grant["seconds_used"] + request["timeout_seconds"]
+        summary = (
+            f"grant {grant['id']}: used {next_used}/3; "
+            f"reserved {next_seconds:g}/30 seconds; evidence {Path(request['evidence']).name}"
+        )
+        _event(output, "runtimeGrantUsed", summary)
+        grant["used"] = next_used
+        grant["seconds_used"] = next_seconds
+        request["grant_used"] = next_used
+        request["grant_seconds_used"] = next_seconds
 
     async def _run_blue_observation(
         self, permit: Any, request: dict[str, Any], phrase: str

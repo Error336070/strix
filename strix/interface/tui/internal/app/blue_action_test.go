@@ -31,7 +31,7 @@ func TestBlueActionParserKeepsWindowsPathsAndExplicitMode(t *testing.T) {
 
 func TestBlueActionPromptSendsPreviewThenTargetBoundConfirmation(t *testing.T) {
 	model, connection := newCommandTestModel(t)
-	model.snapshot = protocol.Snapshot{SetupMode: false, ScanStarted: true, ScanState: "completed", BluePreview: &protocol.BluePreview{}}
+	model.snapshot = protocol.Snapshot{SetupMode: false, ScanStarted: true, ScanState: "completed", BluePreview: &protocol.BluePreview{ScopeSHA256: strings.Repeat("b", 64)}}
 	updated, cmd := model.updateBlue(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
 	model = updated.(Model)
 	if cmd != nil || model.blueActionStage != blueActionCommand {
@@ -91,5 +91,47 @@ func TestBlueActionBlocksQuitWhileObservationRuns(t *testing.T) {
 	state := updated.(Model)
 	if cmd != nil || state.quitting || !strings.Contains(state.errorText, "Wait for completion") {
 		t.Fatal("observation could lose its owning TUI")
+	}
+}
+
+func TestBlueGrantRequiresOperatorObserveAndPreviewEnter(t *testing.T) {
+	model, connection := newCommandTestModel(t)
+	model.snapshot = protocol.Snapshot{SetupMode: false, ScanStarted: true, ScanState: "completed", BluePreview: &protocol.BluePreview{ScopeSHA256: strings.Repeat("b", 64)}}
+	model.snapshot.BlueObservation = &protocol.BlueObservation{
+		Status: "pending", Mode: "launch", Path: `C:\runs\blue\inputs\owned.exe`,
+		SHA256: strings.Repeat("a", 64), TimeoutSeconds: 5,
+		Warning: "This PE may change this Windows host.", Phrase: "LAUNCH abc",
+		GrantPhrase: "GRANT 1234567890ABCDEF1234", GrantExpiresUTC: "2026-10-11T12:10:00+00:00",
+	}
+	model.blueActionStage = blueActionConfirm
+	model.width, model.height = 80, 24
+	view := ansi.Strip(model.blueRunView())
+	for _, want := range []string{"GRANT 1234567890ABCDEF1234", "3 launch actions", "30 total observation seconds", "This PE may change", strings.Repeat("b", 64)} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("grant preview omitted %q", want)
+		}
+	}
+	model.input.SetValue("GRANT 1234567890ABCDEF1234")
+	_, cmd := model.updateBlue(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := commandFromCmd(t, cmd, connection); got.Type != "blue.observe_confirm" {
+		t.Fatalf("grant confirmation sent %s", got.Type)
+	}
+	model, connection = newCommandTestModel(t)
+	model.snapshot.BlueObservation = &protocol.BlueObservation{}
+	model.snapshot.BlueObservation.GrantEligible = true
+	model.snapshot.BlueObservation.GrantUsed = 1
+	model.snapshot.BlueObservation.Status = "pending"
+	model.blueActionStage = blueActionConfirm
+	model.input.SetValue("")
+	_, cmd = model.updateBlue(tea.KeyMsg{Type: tea.KeyEnter})
+	got := commandFromCmd(t, cmd, connection)
+	if got.Type != "blue.observe_confirm" {
+		t.Fatalf("grant reuse sent %s", got.Type)
+	}
+	var payload struct {
+		UseGrant bool `json:"use_grant"`
+	}
+	if err := json.Unmarshal(got.Payload, &payload); err != nil || !payload.UseGrant {
+		t.Fatalf("grant reuse payload: %s, %v", got.Payload, err)
 	}
 }

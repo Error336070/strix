@@ -36,7 +36,14 @@ from strix.interface.viewer.transcript import (
     read_vulnerabilities,
     severity_counts,
 )
-from strix.report.cases import case_timeline, catalog_roots, list_case_runs, resolve_case_run
+from strix.report.cases import (
+    case_finding_locations,
+    case_timeline,
+    catalog_roots,
+    list_case_handoffs,
+    list_case_runs,
+    resolve_case_run,
+)
 
 
 if TYPE_CHECKING:
@@ -175,6 +182,9 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
             try:
+                if not self._same_origin_browser_post():
+                    self._send_json(HTTPStatus.FORBIDDEN, {"error": "cross_origin"})
+                    return
                 if path == "/api/event":
                     self._handle_event()
                 elif path == "/api/auth/otp/start":
@@ -297,13 +307,22 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                             "id": finding.get("id"),
                             "title": finding.get("title"),
                             "severity": finding.get("severity"),
+                            "locations": case_finding_locations(member, finding),
+                            "evidence": finding.get("evidence")
+                            if isinstance(finding.get("evidence"), str)
+                            else "",
                         }
                         for finding in read_vulnerabilities(member.path)
                         if isinstance(finding, dict)
                     )
                 self._send_json(
                     HTTPStatus.OK,
-                    {"case_id": case_id, "runs": members, "findings": findings},
+                    {
+                        "case_id": case_id,
+                        "runs": members,
+                        "findings": findings,
+                        "handoffs": list_case_handoffs(case_id, state.base_dir),
+                    },
                 )
             elif path == "/api/case/timeline":
                 selected = next(
@@ -518,6 +537,18 @@ def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
                 if sep:
                     jar[name] = value
             return jar
+
+        def _same_origin_browser_post(self) -> bool:
+            """Reject browser POSTs from another origin, including sibling ports.
+
+            Non-browser clients can omit these headers; they still need the
+            session capability for protected endpoints.
+            """
+            origin = self.headers.get("Origin")
+            if origin is not None and origin != f"http://{self.headers.get('Host', '')}":
+                return False
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            return fetch_site is None or fetch_site == "same-origin"
 
         def _has_session(self) -> bool:
             """True when the request carries this process's session capability.

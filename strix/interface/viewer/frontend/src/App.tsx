@@ -32,6 +32,7 @@ import {
   type CaseRun,
   type CaseEvent,
   type CaseFinding,
+  type CaseHandoff,
 } from "@/data/serverSource";
 import { runTitle } from "@/lib/target-utils";
 import Sidebar from "@/components/Sidebar";
@@ -57,6 +58,7 @@ export default function App() {
   const [runs, setRuns] = useState<RunsPayload | null>(null);
   const [caseRuns, setCaseRuns] = useState<CaseRun[]>([]);
   const [caseFindings, setCaseFindings] = useState<CaseFinding[]>([]);
+  const [caseHandoffs, setCaseHandoffs] = useState<CaseHandoff[]>([]);
   const [caseId, setCaseId] = useState("");
   const [caseEvents, setCaseEvents] = useState<CaseEvent[]>([]);
   // Whether this viewer can steer a live scan (true only inside the in-TUI
@@ -80,10 +82,11 @@ export default function App() {
           setCaseId(detail.case_id);
           setCaseRuns(detail.runs);
           setCaseFindings(detail.findings);
+          setCaseHandoffs(detail.handoffs);
           setCaseEvents(events);
         }
       } catch {
-        if (!cancelled) { setCaseRuns([]); setCaseFindings([]); setCaseEvents([]); }
+        if (!cancelled) { setCaseRuns([]); setCaseFindings([]); setCaseHandoffs([]); setCaseEvents([]); }
       }
     };
     void refresh();
@@ -309,6 +312,7 @@ export default function App() {
               caseId={caseId}
               runs={caseRuns}
               findings={caseFindings}
+              handoffs={caseHandoffs}
               events={caseEvents}
               onSelectRun={selectRun}
               onOpenFinding={(runId, findingId) => {
